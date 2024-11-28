@@ -1,144 +1,236 @@
-import numpy as np
-import pandas as pd
-from typing import Dict, List, Union, Tuple
 import torch
+from torch.utils.data import Dataset
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
 import logging
+import sys
+import os
 
-class SignalProcessor:
-    """信号处理类"""
-    def __init__(self):
-        # 设置日志
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
-        self.logger = logging.getLogger(__name__)
+# 添加项目根目录到Python路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from project.config import Config
+
+class ModulationDataset(Dataset):
+    """调制信号数据集"""
+    def __init__(self, mode: str = 'train', max_seq_len: Optional[int] = None):
+        self.config = Config()
+        self.mode = mode
+        self.samples = []
+        self.max_seq_len = max_seq_len
         
-    def process_file(self, file_path: str) -> Dict[str, Union[np.ndarray, float]]:
-        """处理单个数据文件
-        Args:
-            file_path: 数据文件路径
-        Returns:
-            处理后的数据字典
-        """
+        # 设置日志
+        self._setup_logging()
+        
+        # 加载数据
+        self._load_data()
+        
+        # 如果没有指定最大序列长度，计算一个合适的值
+        if self.max_seq_len is None:
+            self.max_seq_len = self._calculate_max_seq_len()
+        
+        self.logger.info(f"数据集初始化完成: 模式={mode}, 样本数={len(self.samples)}, 最大序列长度={self.max_seq_len}")
+    
+    def _setup_logging(self):
+        """设置日志"""
+        self.logger = logging.getLogger(f"{self.__class__.__name__}_{self.mode}")
+        if not self.logger.handlers:
+            self.logger.setLevel(logging.INFO)
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            ))
+            self.logger.addHandler(handler)
+    
+    def _calculate_max_seq_len(self, sample_size: int = 1000) -> int:
+        """计算合适的最大序列长度"""
+        lengths = []
+        sampled_indices = np.random.choice(len(self.samples), 
+                                         min(sample_size, len(self.samples)), 
+                                         replace=False)
+        
+        for idx in sampled_indices:
+            try:
+                df = pd.read_csv(self.samples[idx]['file_path'], header=None)
+                lengths.append(len(df))
+            except Exception as e:
+                self.logger.warning(f"计算序列长度时出错: {str(e)}")
+                continue
+        
+        if not lengths:
+            return 1000  # 默认值
+        
+        # 使用95%分位数作为最大长度
+        max_len = int(np.percentile(lengths, 95))
+        return max_len
+    
+    def _load_data(self):
+        """加载数据"""
         try:
-            # 1. 读取数据
-            df = pd.read_csv(file_path, header=None)
-            if df.shape[1] < 5:
-                raise ValueError(f"数据列数不足: {df.shape[1]} < 5")
+            # 计算训练集和验证集的样本数
+            train_samples = int(self.config.SAMPLES_PER_CLASS * 0.8)
+            val_samples = self.config.SAMPLES_PER_CLASS - train_samples
+            target_samples = train_samples if self.mode == 'train' else val_samples
             
-            # 2. 提取数据
+            # 收集所有样本
+            for mod_type, mod_name in self.config.MODULATION_DICT.items():
+                mod_dir = Path('train_data_true') / mod_name
+                if not mod_dir.exists():
+                    raise RuntimeError(f"未找到{mod_name}的数据目录: {mod_dir}")
+                
+                # 获取所有文件
+                all_files = list(mod_dir.glob("*.csv"))
+                if len(all_files) < self.config.SAMPLES_PER_CLASS:
+                    raise RuntimeError(
+                        f"{mod_name}的样本数量不足: "
+                        f"{len(all_files)} < {self.config.SAMPLES_PER_CLASS}"
+                    )
+                
+                # 根据模式选择相应的样本范围
+                if self.mode == 'train':
+                    selected_files = all_files[:train_samples]
+                else:  # val
+                    selected_files = all_files[train_samples:self.config.SAMPLES_PER_CLASS]
+                
+                # 验证并添加样本
+                valid_files = []
+                for file_path in selected_files:
+                    if self._validate_file(file_path):
+                        valid_files.append({
+                            'file_path': str(file_path),
+                            'modulation_type': mod_type - 1  # 转换为0-based索引
+                        })
+                
+                self.samples.extend(valid_files)
+                self.logger.info(f"{mod_name}: 选择{len(selected_files)}个文件, "
+                               f"有效{len(valid_files)}个")
+            
+            # 随机打乱
+            np.random.shuffle(self.samples)
+            
+        except Exception as e:
+            self.logger.error(f"加载数据时出错: {str(e)}")
+            raise
+    
+    def _validate_file(self, file_path: Path) -> bool:
+        """验证单个数据文件"""
+        try:
+            df = pd.read_csv(file_path, header=None)
+            
+            # 基本检查
+            if df.shape[1] < 5:
+                self.logger.warning(f"{file_path}: 列数不足")
+                return False
+            
+            # 检查IQ数据
             i_data = df.iloc[:, 0].values
             q_data = df.iloc[:, 1].values
-            code_sequence = pd.to_numeric(df.iloc[:, 2], errors='coerce').values
-            mod_type = int(df.iloc[0, 3])
+            if len(i_data) != len(q_data):
+                self.logger.warning(f"{file_path}: IQ数据长度不匹配")
+                return False
+            
+            # 检查数值有效性
+            if np.any(np.isnan(i_data)) or np.any(np.isnan(q_data)):
+                self.logger.warning(f"{file_path}: 包含NaN值")
+                return False
+            
+            if np.any(np.isinf(i_data)) or np.any(np.isinf(q_data)):
+                self.logger.warning(f"{file_path}: 包含Inf值")
+                return False
+            
+            # 检查码元宽度
+            symbol_width = float(df.iloc[0, 4])
+            if symbol_width <= 0 or np.isnan(symbol_width):
+                self.logger.warning(f"{file_path}: 无效的码元宽度")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"验证文件{file_path}时出错: {str(e)}")
+            return False
+    
+    def __len__(self) -> int:
+        return len(self.samples)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """获取单个样本"""
+        sample = self.samples[idx]
+        
+        try:
+            # 读取数据
+            df = pd.read_csv(sample['file_path'], header=None)
+            
+            # 获取基本信息
+            i_data = df.iloc[:, 0].values
+            q_data = df.iloc[:, 1].values
             symbol_width = float(df.iloc[0, 4])
             
-            # 3. 数据验证
-            if len(i_data) != len(q_data):
-                raise ValueError(f"IQ数据长度不匹配: {len(i_data)} != {len(q_data)}")
+            # 数据预处理
+            i_data, q_data = self._preprocess_signal_pair(i_data, q_data)
             
-            # 4. 处理码序列
-            valid_code = code_sequence[~np.isnan(code_sequence)]
-            if len(valid_code) == 0:
-                raise ValueError("没有有效的码序列数据")
-            
-            # 5. 检查码元宽度
-            if symbol_width <= 0 or np.isnan(symbol_width):
-                raise ValueError(f"无效的码元宽度: {symbol_width}")
-            
-            # 6. 检查序列长度匹配
-            points_per_symbol = int(symbol_width * 20)  # 每微秒20个采样点
-            expected_iq_len = len(valid_code) * points_per_symbol
-            actual_iq_len = len(i_data)
-            
-            # 7. 调整数据长度，保持码元完整性
-            if actual_iq_len != expected_iq_len:
-                # 计算完整码元数
-                complete_symbols = min(
-                    len(valid_code),
-                    actual_iq_len // points_per_symbol
-                )
-                
-                # 只保留完整的码元
-                valid_code = valid_code[:complete_symbols]
-                i_data = i_data[:complete_symbols * points_per_symbol]
-                q_data = q_data[:complete_symbols * points_per_symbol]
-                
-                self.logger.warning(
-                    f"调整序列长度以保持码元完整性:\n"
-                    f"  - 原始IQ长度: {actual_iq_len}\n"
-                    f"  - 期望IQ长度: {expected_iq_len}\n"
-                    f"  - 调整后长度: {len(i_data)}\n"
-                    f"  - 完整码元数: {complete_symbols}\n"
-                    f"  - 每码元采样点数: {points_per_symbol}"
-                )
-            
-            # 8. 数据归一化
-            i_data = self._normalize(i_data)
-            q_data = self._normalize(q_data)
-            
-            # 9. 验证最终数据
-            final_iq_len = len(i_data)
-            final_code_len = len(valid_code)
-            final_points_per_symbol = final_iq_len / final_code_len
-            
-            if not np.isclose(final_points_per_symbol, points_per_symbol, rtol=1e-5):
-                raise ValueError(
-                    f"码元采样点数不匹配:\n"
-                    f"  - 期望值: {points_per_symbol}\n"
-                    f"  - 实际值: {final_points_per_symbol}"
-                )
-            
+            # 转换为tensor
             return {
-                'i_data': i_data.astype(np.float32),
-                'q_data': q_data.astype(np.float32),
-                'code_sequence': valid_code.astype(np.float32),
-                'symbol_width': symbol_width
+                'data': torch.stack([
+                    torch.tensor(i_data, dtype=torch.float32),
+                    torch.tensor(q_data, dtype=torch.float32)
+                ]),
+                'targets': {
+                    'modulation_type': torch.tensor(sample['modulation_type'], dtype=torch.long),
+                    'symbol_width': torch.tensor(symbol_width, dtype=torch.float32)
+                }
             }
             
         except Exception as e:
-            self.logger.error(f"处理文件 {file_path} 时出错: {str(e)}")
-            raise
+            self.logger.error(f"加载样本{sample['file_path']}时出错: {str(e)}")
+            # 返回一个空样本
+            return self._get_empty_sample(sample['modulation_type'])
     
-    def _normalize(self, data: np.ndarray) -> np.ndarray:
-        """归一化数据
-        Args:
-            data: 输入数据
-        Returns:
-            归一化后的数据
-        """
-        if np.all(data == 0):
-            return data
-        return (data - np.mean(data)) / (np.std(data) + 1e-8)
+    def _preprocess_signal_pair(self, i_data: np.ndarray, q_data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """预处理IQ信号对"""
+        # 标准化
+        i_data = self._normalize(i_data)
+        q_data = self._normalize(q_data)
+        
+        # 调整长度
+        i_data = self._adjust_length(i_data)
+        q_data = self._adjust_length(q_data)
+        
+        return i_data, q_data
     
-    def validate_data(self, file_path: str) -> Tuple[bool, str]:
-        """验证数据文件
-        Args:
-            file_path: 数据文件路径
-        Returns:
-            (是否有效, 错误信息)
-        """
-        try:
-            # 处理数据
-            result = self.process_file(file_path)
-            
-            # 验证IQ数据
-            if np.any(np.isnan(result['i_data'])) or np.any(np.isnan(result['q_data'])):
-                return False, "IQ数据包含NaN值"
-            
-            if np.any(np.isinf(result['i_data'])) or np.any(np.isinf(result['q_data'])):
-                return False, "IQ数据包含Inf值"
-            
-            # 验证码序列
-            if len(result['code_sequence']) == 0:
-                return False, "没有有效的码序列"
-            
-            # 验证码元宽度
-            if result['symbol_width'] <= 0:
-                return False, f"无效的码元宽度: {result['symbol_width']}"
-            
-            return True, "数据有效"
-            
-        except Exception as e:
-            return False, str(e)
+    def _normalize(self, signal: np.ndarray) -> np.ndarray:
+        """信号归一化"""
+        if np.all(signal == 0):
+            return signal
+        return (signal - np.mean(signal)) / (np.std(signal) + 1e-8)
+    
+    def _adjust_length(self, signal: np.ndarray) -> np.ndarray:
+        """调整信号长度"""
+        if len(signal) > self.max_seq_len:
+            return signal[:self.max_seq_len]
+        elif len(signal) < self.max_seq_len:
+            return np.pad(signal, 
+                         (0, self.max_seq_len - len(signal)),
+                         mode='constant')
+        return signal
+    
+    def _get_empty_sample(self, modulation_type: int) -> Dict[str, torch.Tensor]:
+        """生成空样本"""
+        return {
+            'data': torch.zeros((2, self.max_seq_len), dtype=torch.float32),
+            'targets': {
+                'modulation_type': torch.tensor(modulation_type, dtype=torch.long),
+                'symbol_width': torch.tensor(0.0, dtype=torch.float32)
+            }
+        }
+    
+    def get_sample_info(self, idx: int) -> Dict[str, Any]:
+        """获取样本信息"""
+        sample = self.samples[idx]
+        return {
+            'file_path': sample['file_path'],
+            'modulation_type': self.config.MODULATION_DICT[sample['modulation_type'] + 1],
+            'index': idx
+        }
