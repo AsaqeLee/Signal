@@ -8,6 +8,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import gc
 import sys
+import logging
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,6 +16,35 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from project.config import Config
 from project.model.modulation_classifier import ModulationClassifier
 from project.utils.data_processor import ModulationDataset
+
+def setup_logging(config):
+    """设置日志系统"""
+    # 创建日志文件名
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = config.LOG_DIR / f"training_{timestamp}.log"
+    
+    # 配置根日志记录器
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # 清除现有的处理器
+    logger.handlers.clear()
+    
+    # 创建文件处理器
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(file_handler)
+    
+    # 创建控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(console_handler)
+    
+    return logger
 
 def train_one_epoch(model, train_loader, criterion, optimizer, config, epoch, scaler=None):
     """训练一个epoch"""
@@ -24,7 +54,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, config, epoch, sc
     
     # 获取当前学习率
     current_lr = optimizer.param_groups[0]['lr']
-    print(f"\n当前学习率: {current_lr:.6f}")
+    logging.info(f"\n当前学习率: {current_lr:.6f}")
     
     for batch_idx, batch in enumerate(train_loader):
         data = batch['data'].to(config.DEVICE)
@@ -69,9 +99,9 @@ def train_one_epoch(model, train_loader, criterion, optimizer, config, epoch, sc
         
         # 打印进度
         if (batch_idx + 1) % config.LOG_INTERVAL == 0:
-            print(f"Epoch {epoch} [{batch_idx+1}/{len(train_loader)}] "
-                  f"Loss: {loss.item():.4f} "
-                  f"Time: {time.time()-start_time:.2f}s")
+            logging.info(f"Epoch {epoch} [{batch_idx+1}/{len(train_loader)}] "
+                      f"Loss: {loss.item():.4f} "
+                      f"Time: {time.time()-start_time:.2f}s")
     
     avg_loss = total_loss / len(train_loader)
     epoch_time = time.time() - start_time
@@ -124,7 +154,7 @@ def save_checkpoint(model, optimizer, scheduler, config, train_loss, val_loss, v
     # 如果是最佳模型，保存最佳检查点
     if val_accuracy > config.training_state['best_val_score']:
         torch.save(checkpoint, config.BEST_CHECKPOINT)
-        print(f"保存最佳模型，准确率: {val_accuracy:.4f}")
+        logging.info(f"保存最佳模型，准确率: {val_accuracy:.4f}")
 
 def cleanup():
     """清理资源"""
@@ -137,6 +167,9 @@ def train_one_round():
     try:
         # 加载配置
         config = Config()
+        
+        # 设置日志
+        logger = setup_logging(config)
         
         # 创建数据加载器
         train_dataset = ModulationDataset(mode='train')
@@ -166,26 +199,30 @@ def train_one_round():
         optimizer = config.get_optimizer(model.parameters())
         criterion = model.get_loss_function()
         
-        # 创建学习率调度器
-        scheduler = config.get_lr_scheduler(optimizer)
-        
-        # 创建AMP缩放器
-        scaler = torch.cuda.amp.GradScaler() if config.AMP_ENABLED else None
-        
         # 如果存在检查点，加载模型状态
         if config.LAST_CHECKPOINT.exists():
-            print(f"加载检查点: {config.LAST_CHECKPOINT}")
+            logging.info(f"加载检查点: {config.LAST_CHECKPOINT}")
             checkpoint = torch.load(config.LAST_CHECKPOINT)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if scheduler and checkpoint['scheduler_state_dict']:
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            
+            # 设置初始学习率
+            for param_group in optimizer.param_groups:
+                param_group['initial_lr'] = config.LEARNING_RATE
+        
+        # 创建学习率调度器
+        scheduler = config.get_lr_scheduler(optimizer)
+        if scheduler and config.LAST_CHECKPOINT.exists():
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # 创建AMP缩放器
+        scaler = torch.cuda.amp.GradScaler() if config.AMP_ENABLED else None
         
         # 获取当前epoch
         current_epoch = config.training_state['current_epoch']
         
         # 训练一个epoch
-        print(f"\n开始第 {current_epoch + 1} 轮训练...")
+        logging.info(f"\n开始第 {current_epoch + 1} 轮训练...")
         train_loss, epoch_time = train_one_epoch(
             model, train_loader, criterion, optimizer, config, 
             current_epoch + 1, scaler
@@ -193,7 +230,7 @@ def train_one_round():
         
         # 验证
         val_loss, val_accuracy = validate(model, val_loader, criterion, config)
-        print(f"\n验证结果 - Loss: {val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
+        logging.info(f"\n验证结果 - Loss: {val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
         
         # 更新学习率
         if scheduler:
@@ -212,19 +249,19 @@ def train_one_round():
         )
         
         # 打印训练信息
-        print(f"\n第 {current_epoch + 1} 轮训练完成:")
-        print(f"训练损失: {train_loss:.4f}")
-        print(f"验证损失: {val_loss:.4f}")
-        print(f"验证准确率: {val_accuracy:.4f}")
-        print(f"耗时: {timedelta(seconds=int(epoch_time))}")
-        print(f"总训练时间: {timedelta(seconds=int(config.training_state['training_time']))}")
+        logging.info(f"\n第 {current_epoch + 1} 轮训练完成:")
+        logging.info(f"训练损失: {train_loss:.4f}")
+        logging.info(f"验证损失: {val_loss:.4f}")
+        logging.info(f"验证准确率: {val_accuracy:.4f}")
+        logging.info(f"耗时: {timedelta(seconds=int(epoch_time))}")
+        logging.info(f"总训练时间: {timedelta(seconds=int(config.training_state['training_time']))}")
         
         # 检查是否应该早停
         if config.should_stop_early(val_accuracy):
-            print("\n达到早停条件，建议停止训练")
+            logging.info("\n达到早停条件，建议停止训练")
         
     except Exception as e:
-        print(f"训练过程中出错: {str(e)}")
+        logging.error(f"训练过程中出错: {str(e)}", exc_info=True)
         raise
     finally:
         # 清理资源
