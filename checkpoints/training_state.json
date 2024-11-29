@@ -1,10 +1,10 @@
 {
-    "current_epoch": 3,
-    "best_val_score": 0.21552469135802468,
-    "total_epochs_run": 3,
-    "last_lr": 0.0009977832013192385,
-    "training_time": 3479.6901366710663,
-    "last_run_date": "2024-11-28 17:00:31",
+    "current_epoch": 6,
+    "best_val_score": 0.27435185185185185,
+    "total_epochs_run": 6,
+    "last_lr": 0.00099115248173898,
+    "training_time": 6938.320725917816,
+    "last_run_date": "2024-11-28 18:31:06",
     "early_stop_counter": 0,
     "best_epoch": 0
 }
