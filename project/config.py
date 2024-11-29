@@ -38,6 +38,8 @@ class Config:
     
     # 训练参数
     NUM_EPOCHS = 1  # 每次运行一个epoch
+    MAX_EPOCHS = 100  # 最大训练轮数
+    TARGET_ACCURACY = 0.95  # 目标准确率
     LEARNING_RATE = 0.001
     MIN_LEARNING_RATE = 1e-6  # 最小学习率
     VALIDATION_RATIO = 0.2
@@ -90,6 +92,13 @@ class Config:
     SAVE_INTERVAL = 100  # 每隔多少步保存一次模型
     
     def __init__(self):
+        # 检查CUDA可用性
+        self.CUDA_AVAILABLE = torch.cuda.is_available()
+        if not self.CUDA_AVAILABLE and self.DEVICE == 'cuda':
+            self.DEVICE = 'cpu'
+            self.AMP_ENABLED = False
+            print("警告: CUDA不可用,切换到CPU模式")
+        
         # 设置torch线程数
         torch.set_num_threads(self.MAX_WORKERS)
         
