@@ -258,32 +258,35 @@ class ModulationDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """获取单个样本"""
-        sample = self.samples[idx]
-        
+    def __getitem__(self, idx):
         try:
-            # 读取数据
+            # 加载数据
+            sample = self.samples[idx]
             df = pd.read_csv(sample['file_path'], header=None)
             
-            # 获取基本信息
-            i_data = df.iloc[:, 0].values
-            q_data = df.iloc[:, 1].values
+            # 获取IQ数据
+            i_data = df.iloc[:, 0].values.copy()  # 使用copy()确保连续内存
+            q_data = df.iloc[:, 1].values.copy()  # 使用copy()确保连续内存
+            
+            # 获取码元宽度
             symbol_width = float(df.iloc[0, 4])
             
-            # 数据预处理和增强
+            # 预处理信号
             i_data, q_data = self._preprocess_signal_pair(i_data, q_data)
             
-            # 在训练模式下应用数据增强
+            # 如果是训练模式，应用数据增强
             if self.mode == 'train':
                 i_data, q_data = self._apply_augmentations(i_data, q_data)
             
-            # 转换为tensor
+            # 确保数据是连续的
+            i_data = np.ascontiguousarray(i_data)
+            q_data = np.ascontiguousarray(q_data)
+            
+            # 组合为2xN的张量
+            data = torch.from_numpy(np.stack([i_data, q_data])).float()
+            
             return {
-                'data': torch.stack([
-                    torch.tensor(i_data, dtype=torch.float32),
-                    torch.tensor(q_data, dtype=torch.float32)
-                ]),
+                'data': data,
                 'targets': {
                     'modulation_type': torch.tensor(sample['modulation_type'], dtype=torch.long),
                     'symbol_width': torch.tensor(symbol_width, dtype=torch.float32)
@@ -292,7 +295,7 @@ class ModulationDataset(Dataset):
             
         except Exception as e:
             self.logger.error(f"加载样本{sample['file_path']}时出错: {str(e)}")
-            # 返回一个空样本
+            # 返回空样本
             return self._get_empty_sample(sample['modulation_type'])
     
     def _preprocess_signal_pair(self, i_data: np.ndarray, q_data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -332,7 +335,8 @@ class ModulationDataset(Dataset):
         
         # 添加噪声 (80%概率)
         if np.random.random() < 0.8:
-            snr_db = np.random.uniform(self.config.MIN_SNR, self.config.MAX_SNR)
+            # 使用随机SNR值，范围从-10dB到20dB
+            snr_db = np.random.uniform(-10, 20)
             augmentations.append(lambda i, q: self.augmentor.add_noise(i, q, snr_db))
         
         # 频率偏移 (60%概率)

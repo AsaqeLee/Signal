@@ -78,86 +78,76 @@ class ModulationClassifier(BaseModel):
     def __init__(self):
         super().__init__()
         
-        # 初始卷积层
-        self.conv1 = nn.Sequential(
-            nn.Conv1d(2, 64, kernel_size=7, stride=2, padding=3),
+        # 特征提取
+        self.features = nn.Sequential(
+            # 第一层卷积块
+            nn.Conv1d(2, 64, kernel_size=3, padding=1),
             nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            
+            # 第二层卷积块
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            
+            # 第三层卷积块 (添加残差连接)
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            
+            # 注意力层
+            nn.AdaptiveAvgPool1d(1)
         )
         
-        # 残差块
-        self.layer1 = self._make_layer(64, 64, 2)
-        self.layer2 = self._make_layer(64, 128, 2, stride=2)
-        self.layer3 = self._make_layer(128, 256, 2, stride=2)
-        self.layer4 = self._make_layer(256, 512, 2, stride=2)
+        # 残差连接
+        self.shortcut = nn.Sequential(
+            nn.Conv1d(128, 256, kernel_size=1),
+            nn.BatchNorm1d(256)
+        )
         
-        # 全局池化
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        
-        # 调制类型分类器
+        # 调制类型分类
         self.modulation_classifier = nn.Sequential(
-            nn.Linear(512, self.config.FEATURE_DIM),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm1d(self.config.FEATURE_DIM),
+            nn.Linear(256, self.config.FEATURE_DIM),
+            nn.ReLU(),
             nn.Dropout(self.config.DROPOUT_RATE),
-            nn.Linear(self.config.FEATURE_DIM, self.config.FEATURE_DIM // 2),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm1d(self.config.FEATURE_DIM // 2),
-            nn.Dropout(self.config.DROPOUT_RATE),
-            nn.Linear(self.config.FEATURE_DIM // 2, len(self.config.MODULATION_DICT))
+            nn.Linear(self.config.FEATURE_DIM, self.config.NUM_CLASSES)  # 使用NUM_CLASSES
         )
         
-        # 码元宽度回归器
+        # 码元宽度预测
         self.width_regressor = nn.Sequential(
-            nn.Linear(512, self.config.FEATURE_DIM),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm1d(self.config.FEATURE_DIM),
+            nn.Linear(256, self.config.FEATURE_DIM),
+            nn.ReLU(),
             nn.Dropout(self.config.DROPOUT_RATE),
-            nn.Linear(self.config.FEATURE_DIM, self.config.FEATURE_DIM // 2),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm1d(self.config.FEATURE_DIM // 2),
-            nn.Dropout(self.config.DROPOUT_RATE),
-            nn.Linear(self.config.FEATURE_DIM // 2, 1),
-            nn.Softplus()
+            nn.Linear(self.config.FEATURE_DIM, 1),
+            nn.Softplus()  # 确保输出为正值
         )
         
         # 初始化权重
         self._initialize_weights()
-    
-    def _make_layer(self, in_channels, out_channels, num_blocks, stride=1):
-        """创建残差层"""
-        layers = []
-        layers.append(ResidualBlock(in_channels, out_channels, stride))
-        for _ in range(1, num_blocks):
-            layers.append(ResidualBlock(out_channels, out_channels))
-        return nn.Sequential(*layers)
     
     def _initialize_weights(self):
         """初始化模型权重"""
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
+                if m.bias is not None:  # 检查bias是否存在
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm1d):
                 nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+                if m.bias is not None:  # 检查bias是否存在
+                    nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.constant_(m.bias, 0)
+                if m.bias is not None:  # 检查bias是否存在
+                    nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
         # 特征提取
-        x = self.conv1(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        
-        # 全局池化
-        x = self.avg_pool(x)
-        x = x.view(x.size(0), -1)
+        x = self.features(x)  # 输出形状: [batch_size, channels, 1]
+        x = x.squeeze(-1)     # 移除最后一个维度，变为 [batch_size, channels]
         
         # 预测
         return {
