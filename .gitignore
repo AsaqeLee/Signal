@@ -3,3 +3,6 @@ train_data_true/
 logs/
 *.zip
 Git.md
+train_all.py
+Signal/
+checkpoints/
