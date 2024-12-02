@@ -81,44 +81,47 @@ class ModulationClassifier(BaseModel):
         # 特征提取
         self.features = nn.Sequential(
             # 第一层卷积块
-            nn.Conv1d(2, 64, kernel_size=3, padding=1),
+            nn.Conv1d(2, 64, kernel_size=7, padding=3),
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.MaxPool1d(2),
             
             # 第二层卷积块
-            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.Conv1d(64, 128, kernel_size=5, padding=2),
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.MaxPool1d(2),
             
-            # 第三层卷积块 (添加残差连接)
+            # 第三层卷积块
             nn.Conv1d(128, 256, kernel_size=3, padding=1),
             nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.MaxPool1d(2),
             
+            # 第四层卷积块
+            nn.Conv1d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            
             # 注意力层
+            SEBlock(512),
             nn.AdaptiveAvgPool1d(1)
-        )
-        
-        # 残差连接
-        self.shortcut = nn.Sequential(
-            nn.Conv1d(128, 256, kernel_size=1),
-            nn.BatchNorm1d(256)
         )
         
         # 调制类型分类
         self.modulation_classifier = nn.Sequential(
-            nn.Linear(256, self.config.FEATURE_DIM),
+            nn.Linear(512, self.config.FEATURE_DIM),
+            nn.BatchNorm1d(self.config.FEATURE_DIM),
             nn.ReLU(),
             nn.Dropout(self.config.DROPOUT_RATE),
-            nn.Linear(self.config.FEATURE_DIM, self.config.NUM_CLASSES)  # 使用NUM_CLASSES
+            nn.Linear(self.config.FEATURE_DIM, self.config.NUM_CLASSES)
         )
         
         # 码元宽度预测
         self.width_regressor = nn.Sequential(
-            nn.Linear(256, self.config.FEATURE_DIM),
+            nn.Linear(512, self.config.FEATURE_DIM),
+            nn.BatchNorm1d(self.config.FEATURE_DIM),
             nn.ReLU(),
             nn.Dropout(self.config.DROPOUT_RATE),
             nn.Linear(self.config.FEATURE_DIM, 1),
@@ -133,26 +136,29 @@ class ModulationClassifier(BaseModel):
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:  # 检查bias是否存在
-                    nn.init.constant_(m.bias, 0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
             elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
-                if m.bias is not None:  # 检查bias是否存在
-                    nn.init.constant_(m.bias, 0)
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                if m.bias is not None:  # 检查bias是否存在
-                    nn.init.constant_(m.bias, 0)
-    
+                # 使用较小的标准差进行初始化
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+                    
     def forward(self, x):
         # 特征提取
         x = self.features(x)  # 输出形状: [batch_size, channels, 1]
         x = x.squeeze(-1)     # 移除最后一个维度，变为 [batch_size, channels]
         
         # 预测
+        mod_logits = self.modulation_classifier(x)
+        width_pred = self.width_regressor(x)
+        
         return {
-            'modulation_type': self.modulation_classifier(x),
-            'symbol_width': self.width_regressor(x)
+            'modulation_type': mod_logits,  # 不要在这里应用softmax
+            'symbol_width': width_pred
         }
     
     def get_loss_function(self):

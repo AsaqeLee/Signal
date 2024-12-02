@@ -61,6 +61,11 @@ class Config:
     VALIDATION_RATIO = 0.2
     GRADIENT_ACCUMULATION_STEPS = 4  # 减少梯度累步数因为有更大的batch size
     
+    # 早停参数
+    EARLY_STOPPING_PATIENCE = 10  # 早停耐心值
+    EARLY_STOPPING_MIN_DELTA = 0.001  # 最小改善阈值
+    EARLY_STOPPING_MODE = 'max'  # 监控模式: 'min' 用于损失, 'max' 用于准确率
+    
     # 优化器参数
     OPTIMIZER = 'adamw'  # 使用AdamW优化器
     WEIGHT_DECAY = 1e-5
