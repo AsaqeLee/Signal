@@ -10,6 +10,10 @@ import gc
 import sys
 import logging
 import signal
+import wandb  # 添加wandb用于实验追踪
+from torch.cuda.amp import GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -65,6 +69,8 @@ def train_one_epoch(model, train_loader, criterion, optimizer, config, epoch, sc
     global stop_flag
     model.train()
     total_loss = 0
+    correct_mod = 0
+    total = 0
     start_time = time.time()
     
     # 获取当前学习率
@@ -87,6 +93,11 @@ def train_one_epoch(model, train_loader, criterion, optimizer, config, epoch, sc
                 with torch.cuda.amp.autocast():
                     outputs = model(data)
                     loss = criterion(outputs, targets)
+                    
+                    # 计算准确率
+                    pred_mod = torch.argmax(outputs['modulation_type'], dim=1)
+                    correct_mod += (pred_mod == targets['modulation_type']).sum().item()
+                    total += data.size(0)
                 
                 # 缩放损失并反向传播
                 scaler.scale(loss).backward()
@@ -105,6 +116,12 @@ def train_one_epoch(model, train_loader, criterion, optimizer, config, epoch, sc
                 # 常规训练
                 outputs = model(data)
                 loss = criterion(outputs, targets)
+                
+                # 计算准确率
+                pred_mod = torch.argmax(outputs['modulation_type'], dim=1)
+                correct_mod += (pred_mod == targets['modulation_type']).sum().item()
+                total += data.size(0)
+                
                 loss.backward()
                 
                 # 梯度累积
@@ -118,9 +135,21 @@ def train_one_epoch(model, train_loader, criterion, optimizer, config, epoch, sc
             
             # 打印进度
             if (batch_idx + 1) % config.LOG_INTERVAL == 0:
+                accuracy = correct_mod / total
                 logging.info(f"Epoch {epoch} [{batch_idx+1}/{len(train_loader)}] "
                           f"Loss: {loss.item():.4f} "
+                          f"Accuracy: {accuracy:.4f} "
                           f"Time: {time.time()-start_time:.2f}s")
+                
+                # 记录到wandb
+                if config.USE_WANDB:
+                    wandb.log({
+                        "train_batch_loss": loss.item(),
+                        "train_batch_accuracy": accuracy,
+                        "learning_rate": current_lr,
+                        "epoch": epoch,
+                        "batch": batch_idx
+                    })
         
     except Exception as e:
         logging.error(f"训练过程发生错误: {str(e)}")
@@ -131,10 +160,11 @@ def train_one_epoch(model, train_loader, criterion, optimizer, config, epoch, sc
             # 关闭数据加载器
             train_loader._iterator = None
             
-    avg_loss = total_loss / (batch_idx + 1)  # 使用实际处理的批次数
+    avg_loss = total_loss / (batch_idx + 1)
+    accuracy = correct_mod / total
     epoch_time = time.time() - start_time
     
-    return avg_loss, epoch_time
+    return avg_loss, accuracy, epoch_time
 
 def validate(model, val_loader, criterion, config):
     """验证模型"""
@@ -142,6 +172,11 @@ def validate(model, val_loader, criterion, config):
     total_loss = 0
     correct_mod = 0
     total = 0
+    
+    # 添加更多评估指标
+    confusion_matrix = torch.zeros(config.NUM_CLASSES, config.NUM_CLASSES)
+    class_correct = torch.zeros(config.NUM_CLASSES)
+    class_total = torch.zeros(config.NUM_CLASSES)
     
     with torch.no_grad():
         for batch in val_loader:
@@ -156,12 +191,39 @@ def validate(model, val_loader, criterion, config):
             correct_mod += (pred_mod == targets['modulation_type']).sum().item()
             total += data.size(0)
             
+            # 更新混淆矩阵
+            for t, p in zip(targets['modulation_type'], pred_mod):
+                confusion_matrix[t.long(), p.long()] += 1
+                if t == p:
+                    class_correct[t] += 1
+                class_total[t] += 1
+            
             total_loss += loss.item()
     
     avg_loss = total_loss / len(val_loader)
     accuracy = correct_mod / total
     
-    return avg_loss, accuracy
+    # 计算每个类别的准确率
+    class_accuracy = class_correct / class_total
+    
+    # 记录到wandb
+    if config.USE_WANDB:
+        wandb.log({
+            "val_loss": avg_loss,
+            "val_accuracy": accuracy,
+            "confusion_matrix": wandb.plot.confusion_matrix(
+                probs=None,
+                y_true=targets['modulation_type'].cpu(),
+                preds=pred_mod.cpu(),
+                class_names=config.CLASS_NAMES
+            ),
+            "class_accuracies": {
+                f"class_{i}_accuracy": acc.item()
+                for i, acc in enumerate(class_accuracy)
+            }
+        })
+    
+    return avg_loss, accuracy, confusion_matrix, class_accuracy
 
 def save_checkpoint(model, optimizer, scheduler, config, train_loss, val_loss, val_accuracy):
     """保存检查点"""
@@ -200,6 +262,14 @@ def train_one_round():
         # 加载配置
         config = Config()
         
+        # 初始化wandb
+        if config.USE_WANDB:
+            wandb.init(
+                project=config.PROJECT_NAME,
+                name=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                config=config.__dict__
+            )
+        
         # 获取当前epoch和最大轮数
         current_epoch = config.training_state['current_epoch']
         max_epochs = config.MAX_EPOCHS
@@ -222,7 +292,8 @@ def train_one_round():
             shuffle=True,
             num_workers=config.MAX_WORKERS,
             pin_memory=config.PIN_MEMORY,
-            persistent_workers=False  # 禁用持久化worker
+            persistent_workers=True,  # 启用持久化worker
+            prefetch_factor=2  # 预取因子
         )
         
         val_loader = DataLoader(
@@ -231,102 +302,101 @@ def train_one_round():
             shuffle=False,
             num_workers=config.MAX_WORKERS,
             pin_memory=config.PIN_MEMORY,
-            persistent_workers=False  # 禁用持久化worker
+            persistent_workers=True,
+            prefetch_factor=2
         )
         
         # 创建或加载模型
         model = ModulationClassifier()
+        
+        # 使用DDP进行多GPU训练
+        if torch.cuda.device_count() > 1:
+            model = DDP(model)
+        
         model.to(config.DEVICE)
         
         # 创建优化器和损失函数
         optimizer = config.get_optimizer(model.parameters())
         criterion = model.get_loss_function()
         
+        # 创建学习率调度器
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=config.MAX_LR,
+            epochs=config.MAX_EPOCHS,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.3,
+            anneal_strategy='cos',
+            div_factor=25.0,
+            final_div_factor=1000.0
+        )
+        
+        # 创建混合精度训练的scaler
+        scaler = GradScaler() if config.AMP_ENABLED else None
+        
         # 如果存在检查点，加载模型状态
         if config.LAST_CHECKPOINT.exists():
             logging.info(f"加载检查点: {config.LAST_CHECKPOINT}")
-            checkpoint = torch.load(config.LAST_CHECKPOINT, weights_only=True)
+            checkpoint = torch.load(config.LAST_CHECKPOINT)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if scheduler and 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # 训练循环
+        while current_epoch < max_epochs and not stop_flag:
+            # 训练一个epoch
+            train_loss, train_acc, train_time = train_one_epoch(
+                model, train_loader, criterion, optimizer, config,
+                current_epoch, scaler
+            )
             
-            # 设置初始学习率
-            for param_group in optimizer.param_groups:
-                param_group['initial_lr'] = config.LEARNING_RATE
-        
-        # 创建学习率调度器
-        scheduler = config.get_lr_scheduler(optimizer)
-        if scheduler and config.LAST_CHECKPOINT.exists():
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        # 创建AMP缩放器
-        if config.AMP_ENABLED and torch.cuda.is_available():
-            scaler = torch.amp.GradScaler('cuda')
-        else:
-            scaler = None
-            config.AMP_ENABLED = False  # 禁用AMP
-        
-        # 训练一个epoch
-        logging.info(f"\n开始第 {current_epoch + 1} 轮训练...")
-        train_loss, epoch_time = train_one_epoch(
-            model, train_loader, criterion, optimizer, config, 
-            current_epoch + 1, scaler
-        )
-        
-        # 验证
-        val_loss, val_accuracy = validate(model, val_loader, criterion, config)
-        logging.info(f"\n验证结果 - Loss: {val_loss:.4f}, Accuracy: {val_accuracy:.4f}")
-        
-        # 更新学习率
-        if scheduler:
-            scheduler.step()
-        
-        # 保存检查点
-        save_checkpoint(model, optimizer, scheduler, config, train_loss, val_loss, val_accuracy)
-        
-        # 更新训练状态
-        config.save_training_state(
-            current_epoch=current_epoch + 1,
-            best_val_score=max(val_accuracy, config.training_state['best_val_score']),
-            total_epochs_run=config.training_state['total_epochs_run'] + 1,
-            last_lr=optimizer.param_groups[0]['lr'],
-            training_time=config.training_state['training_time'] + epoch_time
-        )
-        
-        # 打印训练信息
-        logging.info(f"\n第 {current_epoch + 1}/{max_epochs} 轮训练完成:")
-        logging.info(f"训练损失: {train_loss:.4f}")
-        logging.info(f"验证损失: {val_loss:.4f}")
-        logging.info(f"验证准确率: {val_accuracy:.4f}")
-        logging.info(f"耗时: {timedelta(seconds=int(epoch_time))}")
-        logging.info(f"总训练时间: {timedelta(seconds=int(config.training_state['training_time']))}")
-        
-        # 检查是否达到目标准确率
-        if val_accuracy >= config.TARGET_ACCURACY:
-            logging.info(f"\n已达到目标准确率 {config.TARGET_ACCURACY},训练结束")
-            return True
+            # 验证
+            val_loss, val_acc, confusion_matrix, class_acc = validate(
+                model, val_loader, criterion, config
+            )
             
-        # 检查是否收到停止信号
-        if stop_flag:
-            logging.info("\n收到停止信号,训练已暂停")
-            return True
-        
-        # 检查是否应该早停
-        if config.should_stop_early(val_accuracy):
-            logging.info("\n达到早停条件,训练结束")
-            return True
+            # 更新学习率
+            if scheduler:
+                scheduler.step()
             
-        return False
-
+            # 记录训练状态
+            logging.info(f"\nEpoch {current_epoch} 完成:")
+            logging.info(f"训练损失: {train_loss:.4f}, 训练准确率: {train_acc:.4f}")
+            logging.info(f"验证损失: {val_loss:.4f}, 验证准确率: {val_acc:.4f}")
+            logging.info(f"每类准确率: {class_acc}")
+            logging.info(f"训练时间: {train_time:.2f}s")
+            
+            # 保存检查点
+            save_checkpoint(
+                model, optimizer, scheduler, config,
+                train_loss, val_loss, val_acc
+            )
+            
+            # 更新训练状态
+            config.training_state['current_epoch'] = current_epoch + 1
+            config.training_state['best_val_score'] = max(
+                config.training_state['best_val_score'],
+                val_acc
+            )
+            
+            current_epoch += 1
+            
+            # 提前停止检查
+            if config.training_state['no_improvement_count'] >= config.EARLY_STOPPING_PATIENCE:
+                logging.info(f"\n{config.EARLY_STOPPING_PATIENCE} 轮未改善,提前停止训练")
+                break
+                
     except Exception as e:
-        logging.error(f"训练过程中出错: {str(e)}", exc_info=True)
+        logging.error(f"训练过程发生错误: {str(e)}")
         raise
     finally:
         # 清理资源
-        if train_loader:
-            train_loader._iterator = None
-        if val_loader:
-            val_loader._iterator = None
         cleanup()
+        if config.USE_WANDB:
+            wandb.finish()
+    
+    return current_epoch >= max_epochs
 
 if __name__ == '__main__':
     config = Config()

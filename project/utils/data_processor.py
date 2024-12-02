@@ -3,15 +3,117 @@ from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import logging
 import sys
 import os
+from scipy import signal
+from scipy.interpolate import interp1d
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from project.config import Config
+
+class SignalAugmentor:
+    """信号增强器"""
+    def __init__(self, config):
+        self.config = config
+        
+    def add_noise(self, i_data: np.ndarray, q_data: np.ndarray,
+                 snr_db: float) -> Tuple[np.ndarray, np.ndarray]:
+        """添加高斯噪声"""
+        # 计算信号功率
+        signal_power = np.mean(i_data**2 + q_data**2)
+        
+        # 计算噪声功率
+        noise_power = signal_power / (10**(snr_db/10))
+        
+        # 生成噪声
+        i_noise = np.random.normal(0, np.sqrt(noise_power/2), len(i_data))
+        q_noise = np.random.normal(0, np.sqrt(noise_power/2), len(q_data))
+        
+        return i_data + i_noise, q_data + q_noise
+    
+    def add_frequency_offset(self, i_data: np.ndarray, q_data: np.ndarray,
+                           max_offset: float = 0.1) -> Tuple[np.ndarray, np.ndarray]:
+        """添加频率偏移"""
+        offset = np.random.uniform(-max_offset, max_offset)
+        t = np.arange(len(i_data))
+        phase = 2 * np.pi * offset * t
+        
+        # 应用频率偏移
+        i_offset = i_data * np.cos(phase) - q_data * np.sin(phase)
+        q_offset = i_data * np.sin(phase) + q_data * np.cos(phase)
+        
+        return i_offset, q_offset
+    
+    def add_phase_noise(self, i_data: np.ndarray, q_data: np.ndarray,
+                       phase_noise_power: float = 0.1) -> Tuple[np.ndarray, np.ndarray]:
+        """添加相位噪声"""
+        phase_noise = np.random.normal(0, np.sqrt(phase_noise_power), len(i_data))
+        phase = np.cumsum(phase_noise)  # 随机游走相位
+        
+        # 应用相位噪声
+        i_noisy = i_data * np.cos(phase) - q_data * np.sin(phase)
+        q_noisy = i_data * np.sin(phase) + q_data * np.cos(phase)
+        
+        return i_noisy, q_noisy
+    
+    def add_multipath(self, i_data: np.ndarray, q_data: np.ndarray,
+                     max_paths: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+        """添加多径效应"""
+        num_paths = np.random.randint(1, max_paths + 1)
+        i_multi = np.zeros_like(i_data)
+        q_multi = np.zeros_like(q_data)
+        
+        for _ in range(num_paths):
+            # 随机延迟和衰减
+            delay = np.random.randint(1, len(i_data)//10)
+            attenuation = np.random.uniform(0.1, 0.5)
+            
+            # 添加延迟路径
+            i_multi[delay:] += attenuation * i_data[:-delay] if delay > 0 else i_data
+            q_multi[delay:] += attenuation * q_data[:-delay] if delay > 0 else q_data
+        
+        return i_data + i_multi, q_data + q_multi
+    
+    def apply_fading(self, i_data: np.ndarray, q_data: np.ndarray,
+                    fading_type: str = 'rayleigh') -> Tuple[np.ndarray, np.ndarray]:
+        """应用衰落"""
+        if fading_type == 'rayleigh':
+            # 瑞利衰落
+            h_real = np.random.normal(0, 1/np.sqrt(2), len(i_data))
+            h_imag = np.random.normal(0, 1/np.sqrt(2), len(i_data))
+        else:  # rician
+            # 莱斯衰落
+            K = 4  # 莱斯因子
+            v = np.sqrt(K/(K+1))  # LOS分量
+            sigma = np.sqrt(1/(2*(K+1)))  # 散射分量标准差
+            h_real = v + np.random.normal(0, sigma, len(i_data))
+            h_imag = np.random.normal(0, sigma, len(i_data))
+        
+        # 应用衰落
+        i_faded = i_data * h_real - q_data * h_imag
+        q_faded = i_data * h_imag + q_data * h_real
+        
+        return i_faded, q_faded
+    
+    def apply_timing_offset(self, i_data: np.ndarray, q_data: np.ndarray,
+                          max_offset: float = 0.1) -> Tuple[np.ndarray, np.ndarray]:
+        """应用定时偏移"""
+        # 生成原始时间点
+        t = np.arange(len(i_data))
+        
+        # 生成新的时间点（带偏移）
+        offset = np.random.uniform(-max_offset, max_offset)
+        t_new = t + offset
+        
+        # 插值
+        i_interp = interp1d(t, i_data, kind='cubic', bounds_error=False, fill_value=0)
+        q_interp = interp1d(t, q_data, kind='cubic', bounds_error=False, fill_value=0)
+        
+        return i_interp(t_new), q_interp(t_new)
 
 class ModulationDataset(Dataset):
     """调制信号数据集"""
@@ -20,6 +122,7 @@ class ModulationDataset(Dataset):
         self.mode = mode
         self.samples = []
         self.max_seq_len = max_seq_len
+        self.augmentor = SignalAugmentor(self.config)
         
         # 设置日志
         self._setup_logging()
@@ -168,8 +271,12 @@ class ModulationDataset(Dataset):
             q_data = df.iloc[:, 1].values
             symbol_width = float(df.iloc[0, 4])
             
-            # 数据预处理
+            # 数据预处理和增强
             i_data, q_data = self._preprocess_signal_pair(i_data, q_data)
+            
+            # 在训练模式下应用数据增强
+            if self.mode == 'train':
+                i_data, q_data = self._apply_augmentations(i_data, q_data)
             
             # 转换为tensor
             return {
@@ -190,9 +297,27 @@ class ModulationDataset(Dataset):
     
     def _preprocess_signal_pair(self, i_data: np.ndarray, q_data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """预处理IQ信号对"""
-        # 标准化
-        i_data = self._normalize(i_data)
-        q_data = self._normalize(q_data)
+        # 去直流
+        i_data = i_data - np.mean(i_data)
+        q_data = q_data - np.mean(q_data)
+        
+        # 功率归一化
+        power = np.mean(i_data**2 + q_data**2)
+        if power > 0:
+            i_data = i_data / np.sqrt(power)
+            q_data = q_data / np.sqrt(power)
+        
+        # 中值滤波去除脉冲噪声
+        i_data = signal.medfilt(i_data, kernel_size=3)
+        q_data = signal.medfilt(q_data, kernel_size=3)
+        
+        # 带通滤波
+        nyq = 0.5 * self.config.SAMPLE_RATE
+        low = self.config.FILTER_LOW_FREQ / nyq
+        high = self.config.FILTER_HIGH_FREQ / nyq
+        b, a = signal.butter(4, [low, high], btype='band')
+        i_data = signal.filtfilt(b, a, i_data)
+        q_data = signal.filtfilt(b, a, q_data)
         
         # 调整长度
         i_data = self._adjust_length(i_data)
@@ -200,20 +325,55 @@ class ModulationDataset(Dataset):
         
         return i_data, q_data
     
-    def _normalize(self, signal: np.ndarray) -> np.ndarray:
-        """信号归一化"""
-        if np.all(signal == 0):
-            return signal
-        return (signal - np.mean(signal)) / (np.std(signal) + 1e-8)
+    def _apply_augmentations(self, i_data: np.ndarray, q_data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """应用数据增强"""
+        # 随机选择要应用的增强方法
+        augmentations = []
+        
+        # 添加噪声 (80%概率)
+        if np.random.random() < 0.8:
+            snr_db = np.random.uniform(self.config.MIN_SNR, self.config.MAX_SNR)
+            augmentations.append(lambda i, q: self.augmentor.add_noise(i, q, snr_db))
+        
+        # 频率偏移 (60%概率)
+        if np.random.random() < 0.6:
+            augmentations.append(lambda i, q: self.augmentor.add_frequency_offset(i, q))
+        
+        # 相位噪声 (40%概率)
+        if np.random.random() < 0.4:
+            augmentations.append(lambda i, q: self.augmentor.add_phase_noise(i, q))
+        
+        # 多径效应 (30%概率)
+        if np.random.random() < 0.3:
+            augmentations.append(lambda i, q: self.augmentor.add_multipath(i, q))
+        
+        # 衰落 (50%概率)
+        if np.random.random() < 0.5:
+            fading_type = np.random.choice(['rayleigh', 'rician'])
+            augmentations.append(lambda i, q: self.augmentor.apply_fading(i, q, fading_type))
+        
+        # 定时偏移 (40%概率)
+        if np.random.random() < 0.4:
+            augmentations.append(lambda i, q: self.augmentor.apply_timing_offset(i, q))
+        
+        # 随机打乱增强顺序并应用
+        np.random.shuffle(augmentations)
+        for aug_func in augmentations:
+            i_data, q_data = aug_func(i_data, q_data)
+        
+        return i_data, q_data
     
     def _adjust_length(self, signal: np.ndarray) -> np.ndarray:
         """调整信号长度"""
         if len(signal) > self.max_seq_len:
-            return signal[:self.max_seq_len]
+            # 随机选择一个起始点
+            start = np.random.randint(0, len(signal) - self.max_seq_len + 1)
+            return signal[start:start + self.max_seq_len]
         elif len(signal) < self.max_seq_len:
+            # 使用反射填充
             return np.pad(signal, 
                          (0, self.max_seq_len - len(signal)),
-                         mode='constant')
+                         mode='reflect')
         return signal
     
     def _get_empty_sample(self, modulation_type: int) -> Dict[str, torch.Tensor]:

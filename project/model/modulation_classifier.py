@@ -10,59 +10,128 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from project.config import Config
 from project.model.base_model import BaseModel
 
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation块"""
+    def __init__(self, channel, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
+class DepthwiseSeparableConv1d(nn.Module):
+    """深度可分离卷积"""
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.depthwise = nn.Conv1d(
+            in_channels, in_channels, kernel_size,
+            stride=stride, padding=padding, groups=in_channels
+        )
+        self.pointwise = nn.Conv1d(in_channels, out_channels, 1)
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+
+class ResidualBlock(nn.Module):
+    """残差块"""
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = DepthwiseSeparableConv1d(
+            in_channels, out_channels, kernel_size=3,
+            stride=stride, padding=1
+        )
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.conv2 = DepthwiseSeparableConv1d(
+            out_channels, out_channels, kernel_size=3,
+            padding=1
+        )
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.se = SEBlock(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm1d(out_channels)
+            )
+    
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
 class ModulationClassifier(BaseModel):
     def __init__(self):
         super().__init__()
         
-        # 特征提取
-        self.features = nn.Sequential(
-            # 第一层卷积块
-            nn.Conv1d(2, 64, kernel_size=3, padding=1),
+        # 初始卷积层
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(2, 64, kernel_size=7, stride=2, padding=3),
             nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            
-            # 第二层卷积块
-            nn.Conv1d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            
-            # 第三层卷积块 (添加残差连接)
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            
-            # 注意力层
-            nn.AdaptiveAvgPool1d(1)
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
         )
         
-        # 残差连接
-        self.shortcut = nn.Sequential(
-            nn.Conv1d(128, 256, kernel_size=1),
-            nn.BatchNorm1d(256)
-        )
+        # 残差块
+        self.layer1 = self._make_layer(64, 64, 2)
+        self.layer2 = self._make_layer(64, 128, 2, stride=2)
+        self.layer3 = self._make_layer(128, 256, 2, stride=2)
+        self.layer4 = self._make_layer(256, 512, 2, stride=2)
         
-        # 调制类型分类
+        # 全局池化
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # 调制类型分类器
         self.modulation_classifier = nn.Sequential(
-            nn.Linear(256, self.config.FEATURE_DIM),
-            nn.ReLU(),
+            nn.Linear(512, self.config.FEATURE_DIM),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(self.config.FEATURE_DIM),
             nn.Dropout(self.config.DROPOUT_RATE),
-            nn.Linear(self.config.FEATURE_DIM, len(self.config.MODULATION_DICT))
+            nn.Linear(self.config.FEATURE_DIM, self.config.FEATURE_DIM // 2),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(self.config.FEATURE_DIM // 2),
+            nn.Dropout(self.config.DROPOUT_RATE),
+            nn.Linear(self.config.FEATURE_DIM // 2, len(self.config.MODULATION_DICT))
         )
         
-        # 码元宽度预测
+        # 码元宽度回归器
         self.width_regressor = nn.Sequential(
-            nn.Linear(256, self.config.FEATURE_DIM),
-            nn.ReLU(),
+            nn.Linear(512, self.config.FEATURE_DIM),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(self.config.FEATURE_DIM),
             nn.Dropout(self.config.DROPOUT_RATE),
-            nn.Linear(self.config.FEATURE_DIM, 1),
-            nn.Softplus()  # 确保输出为正值
+            nn.Linear(self.config.FEATURE_DIM, self.config.FEATURE_DIM // 2),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(self.config.FEATURE_DIM // 2),
+            nn.Dropout(self.config.DROPOUT_RATE),
+            nn.Linear(self.config.FEATURE_DIM // 2, 1),
+            nn.Softplus()
         )
         
         # 初始化权重
         self._initialize_weights()
+    
+    def _make_layer(self, in_channels, out_channels, num_blocks, stride=1):
+        """创建残差层"""
+        layers = []
+        layers.append(ResidualBlock(in_channels, out_channels, stride))
+        for _ in range(1, num_blocks):
+            layers.append(ResidualBlock(out_channels, out_channels))
+        return nn.Sequential(*layers)
     
     def _initialize_weights(self):
         """初始化模型权重"""
@@ -80,23 +149,31 @@ class ModulationClassifier(BaseModel):
     
     def forward(self, x):
         # 特征提取
-        features = self.features(x)
-        features = features.squeeze(-1)
+        x = self.conv1(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        
+        # 全局池化
+        x = self.avg_pool(x)
+        x = x.view(x.size(0), -1)
         
         # 预测
         return {
-            'modulation_type': self.modulation_classifier(features),
-            'symbol_width': self.width_regressor(features)
+            'modulation_type': self.modulation_classifier(x),
+            'symbol_width': self.width_regressor(x)
         }
     
     def get_loss_function(self):
         """获取损失函数"""
         def criterion(outputs, targets):
-            # 调制类型损失（带标签平滑的交叉熵）
-            mod_loss = self._label_smoothing_loss(
+            # 调制类型损失（带标签平滑和焦点损失的组合）
+            mod_loss = self._focal_loss_with_smoothing(
                 outputs['modulation_type'],
                 targets['modulation_type'],
-                smoothing=0.1
+                smoothing=0.1,
+                gamma=2.0
             )
             
             # 码元宽度损失（相对误差 + Huber损失的组合）
@@ -115,13 +192,26 @@ class ModulationClassifier(BaseModel):
         
         return criterion
     
-    def _label_smoothing_loss(self, pred, target, smoothing=0.1):
-        """带标签平滑的交叉熵损失"""
+    def _focal_loss_with_smoothing(self, pred, target, smoothing=0.1, gamma=2.0):
+        """带标签平滑的焦点损失"""
         n_classes = pred.size(1)
+        
+        # 标签平滑
         one_hot = torch.zeros_like(pred).scatter(1, target.unsqueeze(1), 1)
         smooth_one_hot = one_hot * (1 - smoothing) + smoothing / n_classes
-        log_prob = F.log_softmax(pred, dim=1)
-        return (-smooth_one_hot * log_prob).sum(dim=1).mean()
+        
+        # 计算概率
+        probs = F.softmax(pred, dim=1)
+        log_probs = F.log_softmax(pred, dim=1)
+        
+        # 焦点损失
+        pt = (smooth_one_hot * probs).sum(dim=1)
+        focal_weight = (1 - pt) ** gamma
+        
+        loss = (-smooth_one_hot * log_probs).sum(dim=1)
+        focal_loss = focal_weight * loss
+        
+        return focal_loss.mean()
     
     def _width_loss(self, pred, target, beta=0.1):
         """组合码元宽度损失"""
@@ -131,5 +221,8 @@ class ModulationClassifier(BaseModel):
         # Huber损失
         huber_loss = F.smooth_l1_loss(pred, target, beta=beta)
         
+        # L1正则化
+        l1_reg = torch.abs(pred).mean()
+        
         # 组合损失
-        return relative_error.mean() + huber_loss
+        return relative_error.mean() + huber_loss + 0.01 * l1_reg
