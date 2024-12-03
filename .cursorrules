@@ -326,3 +326,77 @@ Key Conventions:
 
 Refer to the official documentation of PyTorch, Transformers, Diffusers, and Gradio for best practices and up-to-date APIs.
       
+### 慎重修改代码并检查全局影响
+
+---
+
+#### **Key Principles:**
+- Prioritize minimal, impactful modifications to reduce unintended side effects.
+- Ensure all related files and components are updated consistently to maintain functionality.
+- Minimize interruptions by consolidating checks and user interactions into a single, efficient process.
+- Provide clear, actionable suggestions for handling dependencies and related updates.
+
+---
+
+#### **Modification Handling:**
+- **Trigger**: Any modification to code that could affect external references or dependencies (e.g., variable renaming, function signature changes, class structure updates).
+- **Behavior**:
+  - Automatically analyze the scope of the modification and identify affected files, components, and dependencies.
+  - Generate a list of all impacted locations and suggest appropriate updates for each.
+  - Use static analysis tools (e.g., Abstract Syntax Tree traversal) to identify all references in the project.
+
+---
+
+#### **Global Impact Check:**
+- Before finalizing a modification:
+  - **Dependency Analysis**:
+    - Trace all occurrences of the modified code across the project.
+    - Categorize references by type (e.g., direct calls, imports, tests).
+  - **Impact Scoring**:
+    - Assign severity levels to the impact based on dependency depth and criticality.
+  - **Actionable Insights**:
+    - Highlight high-priority updates with justifications.
+    - Suggest skipping updates where changes are non-critical.
+
+---
+
+#### **User Interaction:**
+- Consolidate all suggestions into a single panel or modal for user review.
+- **Options**:
+  - Apply changes across all dependencies automatically.
+  - Select specific files or modules for manual review and update.
+  - Defer non-critical updates with a record of pending tasks.
+- **Prevent Redundancy**:
+  - Log completed updates to avoid repeat prompts.
+  - Implement version control hooks (e.g., pre-commit checks) to ensure consistency.
+
+---
+
+#### **Performance Optimization:**
+- Limit checks to modified files and immediate dependencies during incremental edits.
+- Use caching to store analysis results for large projects, reducing redundant processing.
+- Integrate with IDE tools for real-time feedback without disrupting the workflow.
+
+---
+
+#### **Error Handling:**
+- Provide clear, descriptive messages for unresolved or conflicting dependencies.
+- Implement robust fallback mechanisms (e.g., revert to pre-modification state) to recover from errors.
+- Use detailed logging for tracking changes and debugging failed updates.
+
+---
+
+#### **Dependencies:**
+- Static analysis tools (e.g., `pylint`, `mypy`) for dependency tracking.
+- Version control integration (e.g., `git`) for modification rollback and tracking.
+- IDE plugins for real-time feedback and context-aware suggestions.
+
+---
+
+#### **Best Practices:**
+1. Begin with clear documentation of changes and their intent.
+2. Use modular design to minimize interdependence of components.
+3. Regularly test changes in an isolated environment before integrating globally.
+4. Ensure all updates are aligned with the project's coding standards and guidelines.
+5. Use CI/CD pipelines to verify updates and their impacts on the system.
+
