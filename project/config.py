@@ -68,7 +68,11 @@ class Config:
     
     # 集成学习参数
     ENSEMBLE_MODE = 'max_confidence'  # 集成决策模式: 'max_confidence' 或 'voting'
-    CONFIDENCE_THRESHOLD = 0.5  # 置信度阈值
+    CONFIDENCE_THRESHOLD = 0.8  # 置信度阈值
+    MIN_VOTE_CONFIDENCE = 0.6  # 最小投票置信度
+    VALIDATION_RATIO = 0.2  # 验证集比例
+    USE_NEGATIVE_FEEDBACK = True  # 是否使用其他分类器的否定反馈
+    NEGATIVE_WEIGHT = 0.3  # 否定反馈的权重
     PARALLEL_TRAINING = True  # 是否并行训练分类器
     SAVE_ALL_MODELS = True  # 是否保存所有分类器
     
@@ -144,7 +148,7 @@ class Config:
     def __init__(self):
         # 基础路径配置
         self.PROJECT_ROOT = Path(__file__).parent.parent
-        self.DATA_DIR = self.PROJECT_ROOT / "train_data_true"  # 修改为正确的数据目录
+        self.DATA_DIR = self.PROJECT_ROOT / "train_data_true"
         self.CHECKPOINT_DIR = self.PROJECT_ROOT / "checkpoints"
         self.LOG_DIR = self.PROJECT_ROOT / "logs"
         
@@ -190,6 +194,24 @@ class Config:
         self.AMP_ENABLED = True
         self.USE_MIXUP = True
         self.USE_CUTMIX = True
+        
+        # 数据加载器配置
+        self.NUM_WORKERS = min(os.cpu_count(), 8)
+        self.PIN_MEMORY = True
+        self.PREFETCH_FACTOR = 2
+        
+        # wandb配置
+        self.USE_WANDB = True
+        self.WANDB_PROJECT = "modulation-classification"
+        self.WANDB_ENTITY = None
+        
+        # 集成学习配置
+        self.ENSEMBLE_MODE = 'max_confidence'  # 'max_confidence' 或 'voting'
+        self.CONFIDENCE_THRESHOLD = 0.8  # 置信度阈值
+        self.MIN_VOTE_CONFIDENCE = 0.6  # 最小投票置信度
+        self.VALIDATION_RATIO = 0.2  # 验证集比例
+        self.USE_NEGATIVE_FEEDBACK = True  # 是否使用其他分类器的否定反馈
+        self.NEGATIVE_WEIGHT = 0.3  # 否定反馈的权重
         
         # 为每个调制类型创建检查点目录
         for mod_name in self.MODULATION_DICT.values():
