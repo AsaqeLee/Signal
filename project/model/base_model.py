@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Dict, Any
-from ..config import Config
+from project.config import Config
 
 class BaseModel(nn.Module):
     def __init__(self):

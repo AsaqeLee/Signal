@@ -66,6 +66,12 @@ class Config:
     EARLY_STOPPING_MIN_DELTA = 0.001  # 最小改善阈值
     EARLY_STOPPING_MODE = 'max'  # 监控模式: 'min' 用于损失, 'max' 用于准确率
     
+    # 集成学习参数
+    ENSEMBLE_MODE = 'max_confidence'  # 集成决策模式: 'max_confidence' 或 'voting'
+    CONFIDENCE_THRESHOLD = 0.5  # 置信度阈值
+    PARALLEL_TRAINING = True  # 是否并行训练分类器
+    SAVE_ALL_MODELS = True  # 是否保存所有分类器
+    
     # 优化器参数
     OPTIMIZER = 'adamw'  # 使用AdamW优化器
     WEIGHT_DECAY = 1e-5
@@ -129,68 +135,87 @@ class Config:
     STATE_FILE = CHECKPOINT_DIR / "training_state.json"  # 训练状态文件
     LAST_CHECKPOINT = CHECKPOINT_DIR / "last_checkpoint.pth"  # 最新检查点
     BEST_CHECKPOINT = CHECKPOINT_DIR / "best_checkpoint.pth"  # 最佳检查点
+    LOG_FILE = LOG_DIR / "training.log"  # 日志文件
+    
+    # 信号参数
+    SIGNAL_LENGTH = 1024  # 信号长度
+    SAMPLE_RATE = 20e6  # 采样率
     
     def __init__(self):
+        # 基础路径配置
+        self.PROJECT_ROOT = Path(__file__).parent.parent
+        self.DATA_DIR = self.PROJECT_ROOT / "train_data_true"  # 修改为正确的数据目录
+        self.CHECKPOINT_DIR = self.PROJECT_ROOT / "checkpoints"
+        self.LOG_DIR = self.PROJECT_ROOT / "logs"
+        
         # 检查数据目录
         if not self.DATA_DIR.exists():
             raise RuntimeError(f"数据目录不存在: {self.DATA_DIR}")
+            
+        # 检查数据目录下的调制类型子目录
+        for mod_name in self.MODULATION_DICT.values():
+            mod_dir = self.DATA_DIR / mod_name
+            if not mod_dir.exists():
+                raise RuntimeError(f"调制类型目录不存在: {mod_dir}")
         
-        # 创建必要的目录（使用parents=True确保父目录也被创建）
-        self.OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
-        self.CHECKPOINT_DIR.mkdir(exist_ok=True, parents=True)
-        self.LOG_DIR.mkdir(exist_ok=True, parents=True)
+        # 创建必要的目录
+        self.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        self.LOG_DIR.mkdir(parents=True, exist_ok=True)
         
-        # 备份并清理旧的检查点
+        # 日志文件配置
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.LOG_FILE = self.LOG_DIR / f"training_{timestamp}.log"
+        
+        # 检查点文件配置
+        self.LAST_CHECKPOINT = self.CHECKPOINT_DIR / "last_checkpoint.pth"
+        self.BEST_CHECKPOINT = self.CHECKPOINT_DIR / "best_checkpoint.pth"
+        self.TRAINING_STATE = self.CHECKPOINT_DIR / "training_state.json"
+        
+        # 训练状态
+        self.training_state = {
+            'current_epoch': 0,
+            'best_val_score': float('-inf'),
+            'early_stop_counter': 0
+        }
+        
+        # 清理旧的检查点
         self._backup_and_clean_checkpoints()
         
-        # 检查CUDA可用性
-        self.CUDA_AVAILABLE = torch.cuda.is_available()
-        if not self.CUDA_AVAILABLE and self.DEVICE == 'cuda':
-            self.DEVICE = 'cpu'
-            self.AMP_ENABLED = False
-            print("警告: CUDA不可用,切换到CPU模式")
+        # 设备配置
+        self.DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 不限制torch线程数
-        if torch.cuda.is_available():
-            # 不限制GPU内存使用
-            torch.cuda.empty_cache()
+        # 训练参数
+        self.BATCH_SIZE = 512
+        self.GRADIENT_ACCUMULATION_STEPS = 4
+        self.AMP_ENABLED = True
+        self.USE_MIXUP = True
+        self.USE_CUTMIX = True
         
-        # 加载训练状态
-        self.training_state = self.load_training_state()
-        
-        # 打印重要配置信息
-        print("\n=== 配置信息 ===")
-        print(f"运行设备: {self.DEVICE}")
-        print(f"批次大小: {self.BATCH_SIZE}")
-        print(f"梯度累积步数: {self.GRADIENT_ACCUMULATION_STEPS}")
-        print(f"有效批次大小: {self.BATCH_SIZE * self.GRADIENT_ACCUMULATION_STEPS}")
-        print(f"当前epoch: {self.training_state['current_epoch']}")
-        print(f"最佳验证分数: {self.training_state['best_val_score']:.4f}")
-        print(f"CPU核心数: {self.MAX_WORKERS}")
-        print(f"是否使用AMP: {self.AMP_ENABLED}")
-        print(f"是否使用数据增强: Mixup={self.USE_MIXUP}, CutMix={self.USE_CUTMIX}")
-        print("===============\n")
+        # 为每个调制类型创建检查点目录
+        for mod_name in self.MODULATION_DICT.values():
+            mod_checkpoint_dir = self.CHECKPOINT_DIR / mod_name
+            mod_checkpoint_dir.mkdir(exist_ok=True, parents=True)
     
     def _backup_and_clean_checkpoints(self):
-        """备份并清理旧的检查点文件"""
-        timestamp = int(time.time())
-        
-        # 备份检查点文件
-        for checkpoint_file in [self.LAST_CHECKPOINT, self.BEST_CHECKPOINT]:
-            if checkpoint_file.exists():
-                backup_file = checkpoint_file.parent / f"{checkpoint_file.stem}_backup_{timestamp}{checkpoint_file.suffix}"
-                shutil.copy2(checkpoint_file, backup_file)
-                checkpoint_file.unlink()  # 删除原文件
-                print(f"已备份检查点到: {backup_file}")
-        
-        # 清理训练状态文件
-        if self.STATE_FILE.exists():
-            backup_file = self.STATE_FILE.parent / f"training_state_backup_{timestamp}.json"
-            shutil.copy2(self.STATE_FILE, backup_file)
-            self.STATE_FILE.unlink()  # 删除原文件
-            print(f"已备份训练状态到: {backup_file}")
-        
-        print("已清理所有旧的检查点文件")
+        """备份并清理检查点文件"""
+        # 只在开始新的训练时清理
+        if self.training_state['current_epoch'] == 0:
+            # 清理主检查点目录
+            for checkpoint in self.CHECKPOINT_DIR.glob("*.pth"):
+                checkpoint.unlink()
+            if self.TRAINING_STATE.exists():
+                self.TRAINING_STATE.unlink()
+                
+            # 清理每个调制类型的检查点目录
+            for mod_name in self.MODULATION_DICT.values():
+                mod_dir = self.CHECKPOINT_DIR / mod_name
+                if mod_dir.exists():
+                    for checkpoint in mod_dir.glob("*.pth"):
+                        checkpoint.unlink()
+                    for state_file in mod_dir.glob("*.json"):
+                        state_file.unlink()
+            
+            print("已清理所有旧的检查点文件")
     
     def load_training_state(self):
         """加载训练状态"""
@@ -312,3 +337,12 @@ class Config:
             return True
         
         return False
+    
+    def get_classifier_paths(self, mod_name):
+        """获取特定调制类型的模型路径"""
+        mod_dir = self.CHECKPOINT_DIR / mod_name
+        return {
+            'state': mod_dir / "training_state.json",
+            'last': mod_dir / "last_checkpoint.pth",
+            'best': mod_dir / "best_checkpoint.pth"
+        }

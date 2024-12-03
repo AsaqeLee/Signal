@@ -222,3 +222,71 @@ class ModulationClassifier(BaseModel):
         
         # 组合损失
         return relative_error.mean() + huber_loss + 0.01 * l1_reg
+
+class ModulationClassifierEnsemble(BaseModel):
+    """调制分类器集成模型"""
+    def __init__(self):
+        super().__init__()
+        self.classifiers = nn.ModuleDict()
+        
+        # 为每种调制类型创建一个分类器
+        for mod_type, mod_name in self.config.MODULATION_DICT.items():
+            classifier = ModulationClassifier()
+            # 修改最后的分类层为二分类
+            classifier.modulation_classifier[-1] = nn.Linear(self.config.FEATURE_DIM, 1)
+            self.classifiers[mod_name] = classifier
+    
+    def forward(self, x):
+        # 收集每个分类器的预测结果
+        predictions = {}
+        confidences = {}
+        
+        for mod_name, classifier in self.classifiers.items():
+            # 获取每个分类器的预测
+            outputs = classifier(x)
+            pred = torch.sigmoid(outputs['modulation_type'])  # 使用sigmoid获取置信度
+            predictions[mod_name] = pred
+            confidences[mod_name] = pred.mean()  # 使用平均置信度
+        
+        # 找到置信度最高的预测
+        max_confidence = -float('inf')
+        predicted_mod = None
+        
+        for mod_name, confidence in confidences.items():
+            if confidence > max_confidence:
+                max_confidence = confidence
+                predicted_mod = mod_name
+        
+        # 返回预测结果和置信度
+        return {
+            'predictions': predictions,
+            'confidences': confidences,
+            'predicted_mod': predicted_mod,
+            'max_confidence': max_confidence
+        }
+    
+    def train_single_classifier(self, mod_name, data, targets):
+        """训练单个分类器"""
+        classifier = self.classifiers[mod_name]
+        outputs = classifier(data)
+        
+        # 计算二分类损失
+        loss = F.binary_cross_entropy_with_logits(
+            outputs['modulation_type'],
+            (targets['modulation_type'] == self.config.MODULATION_DICT.index(mod_name)).float()
+        )
+        
+        return loss
+    
+    def save_classifiers(self, path):
+        """保存所有分类器"""
+        for mod_name, classifier in self.classifiers.items():
+            save_path = path / f"{mod_name}_classifier.pth"
+            classifier.save_model(str(save_path))
+    
+    def load_classifiers(self, path):
+        """加载所有分类器"""
+        for mod_name, classifier in self.classifiers.items():
+            load_path = path / f"{mod_name}_classifier.pth"
+            if load_path.exists():
+                classifier.load_model(str(load_path))
