@@ -16,6 +16,7 @@ class Config:
     MAX_MEMORY = None  # 不限制内存使用
     
     # 数据参数
+    SEQUENCE_LENGTH = 2048  # 统一的序列长度
     SAMPLE_RATE = 20e6  # 20MHz，即每微秒20个采样点
     SAMPLES_PER_CLASS = 16200  # 每个调制类型的样本数
     FILTER_LOW_FREQ = 0.002  # 归一化后的低频截止频率 (20kHz/10MHz)
@@ -26,9 +27,63 @@ class Config:
     USE_SNR_FILTER = False  # 是否使用SNR过滤，设为False表示接受所有信噪比
     SNR_UNKNOWN = -999  # 用于表示未知或不需要考虑SNR的情况
     
-    # 模型参数 - 优化GPU使用
+    # 模型参数
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    BATCH_SIZE = 512  # 增大批次大小以充分利用GPU
+    BATCH_SIZE = 128  # 减小批次大小以适应内存
+    FEATURE_DIM = 256  # 特征维度
+    DROPOUT_RATE = 0.3  # Dropout比率
+    
+    # 集成学习参数
+    ENSEMBLE_MODE = 'hybrid'  # 'max_confidence', 'voting', 或 'hybrid'
+    CONFIDENCE_THRESHOLD = 0.8  # 置信度阈值
+    MIN_VOTE_CONFIDENCE = 0.6  # 最小投票置信度
+    TEMPERATURE = 2.0  # 温度缩放参数
+    CONSISTENCY_WEIGHT = 0.3  # 一致性得分权重
+    VOTE_WEIGHT = 0.4  # 投票权重
+    CONFIDENCE_WEIGHT = 0.6  # 置信度权重
+    USE_TEMPERATURE_SCALING = True  # 是否使用温度缩放
+    USE_CONSISTENCY_SCORE = True  # 是否使用一致性得分
+    MIN_CONSISTENCY_THRESHOLD = 0.5  # 最小一致性阈值
+    
+    # 训练参数
+    NUM_EPOCHS = 50  # 每个分类器的训练轮数
+    LEARNING_RATE = 0.001  # 初始学习率
+    MIN_LEARNING_RATE = 1e-6  # 最小学习率
+    WEIGHT_DECAY = 1e-5  # 权重衰减
+    GRADIENT_CLIP_VAL = 1.0  # 梯度裁剪阈值
+    VALIDATION_RATIO = 0.2  # 验证集比例
+    
+    # 早停参数
+    EARLY_STOPPING_PATIENCE = 10  # 早停耐心值
+    EARLY_STOPPING_MIN_DELTA = 0.001  # 最小改善阈值
+    EARLY_STOPPING_MODE = 'max'  # 监控模式: 'min' 用于损失, 'max' 用于准确率
+    
+    # 数据增强参数
+    USE_MIXUP = True  # 是否使用Mixup
+    MIXUP_ALPHA = 0.2  # Mixup参数
+    USE_CUTMIX = True  # 是否使用CutMix
+    CUTMIX_ALPHA = 1.0  # CutMix参数
+    
+    # 优化器参数
+    OPTIMIZER = 'adamw'  # 使用AdamW优化器
+    MOMENTUM = 0.9  # SGD动量（如果使用SGD）
+    BETA1 = 0.9  # Adam/AdamW的beta1参数
+    BETA2 = 0.999  # Adam/AdamW的beta2参数
+    EPS = 1e-8  # Adam/AdamW的epsilon参数
+    
+    # 学习率调度参数
+    LR_SCHEDULER = 'cosine'  # 使用余弦退火调度
+    LR_DECAY_RATE = 0.1  # 学习率衰减率
+    LR_STEP_SIZE = 30  # 学习率衰减步长
+    WARMUP_EPOCHS = 5  # 预热轮数
+    WARMUP_METHOD = 'linear'  # 预热方式
+    
+    # 日志和检查点参数
+    LOG_INTERVAL = 10  # 每10个batch打印一次日志
+    SAVE_INTERVAL = 100  # 每100个batch保存一次检查点
+    USE_WANDB = True  # 是否使用wandb
+    WANDB_PROJECT = "modulation-classification"  # wandb项目名称
+    WANDB_ENTITY = None  # wandb实体名称
     
     # 调制类型映射
     MODULATION_DICT = {
@@ -52,32 +107,22 @@ class Config:
     SW_WEIGHT = 0.6  # 码元宽度权重
     
     # 训练参数 - 优化训练过程
-    NUM_EPOCHS = 1  # 每次运行一个epoch
     MAX_EPOCHS = 100  # 最大训练轮数
     TARGET_ACCURACY = 0.95  # 目标准确率
-    LEARNING_RATE = 0.001
-    MAX_LR = 3e-4  # 最大学习率,用于OneCycleLR调度器
-    MIN_LEARNING_RATE = 1e-6
-    VALIDATION_RATIO = 0.2
-    GRADIENT_ACCUMULATION_STEPS = 4  # 减少梯度累步数因为有更大的batch size
-    
-    # 早停参数
-    EARLY_STOPPING_PATIENCE = 10  # 早停耐心值
-    EARLY_STOPPING_MIN_DELTA = 0.001  # 最小改善阈值
-    EARLY_STOPPING_MODE = 'max'  # 监控模式: 'min' 用于损失, 'max' 用于准确率
     
     # 集成学习参数
-    ENSEMBLE_MODE = 'max_confidence'  # 集成决策模式: 'max_confidence' 或 'voting'
     CONFIDENCE_THRESHOLD = 0.8  # 置信度阈值
     MIN_VOTE_CONFIDENCE = 0.6  # 最小投票置信度
-    VALIDATION_RATIO = 0.2  # 验证集比例
-    USE_NEGATIVE_FEEDBACK = True  # 是否使用其他分类器的否定反馈
-    NEGATIVE_WEIGHT = 0.3  # 否定反馈的权重
-    PARALLEL_TRAINING = True  # 是否并行训练分类器
-    SAVE_ALL_MODELS = True  # 是否保存所有分类器
+    TEMPERATURE = 2.0  # 温度缩放参数
+    CONSISTENCY_WEIGHT = 0.3  # 一致性得分权重
+    VOTE_WEIGHT = 0.4  # 投票权重
+    CONFIDENCE_WEIGHT = 0.6  # 置信度权重
+    USE_TEMPERATURE_SCALING = True  # 是否使用温度缩放
+    USE_CONSISTENCY_SCORE = True  # 是否使用一致性得分
+    MIN_CONSISTENCY_THRESHOLD = 0.5  # 最小一致性阈值
     
     # 优化器参数
-    OPTIMIZER = 'adamw'  # 使用AdamW优化器
+    OPTIMIZER = 'adamw'
     WEIGHT_DECAY = 1e-5
     MOMENTUM = 0.9
     BETA1 = 0.9
@@ -90,11 +135,6 @@ class Config:
     LR_STEP_SIZE = 30
     WARMUP_EPOCHS = 5
     WARMUP_METHOD = 'linear'
-    
-    # 模型参数
-    FEATURE_DIM = 256  # 增大特征维度
-    DROPOUT_RATE = 0.3  # 减小dropout率
-    LABEL_SMOOTHING = 0.1
     
     # 数据增强参数
     USE_MIXUP = True
@@ -115,35 +155,11 @@ class Config:
     # 日志和检查点参数
     LOG_INTERVAL = 10  # 每10个batch打印一次日志
     SAVE_INTERVAL = 100  # 每100个batch保存一次检查点
-    EARLY_STOP_PATIENCE = 15  # 15轮无改善就早停
     
     # 实验追踪参数
-    USE_WANDB = False  # 默认不使用wandb
-    WANDB_PROJECT = "modulation_classification"  # wandb目名称
+    USE_WANDB = True  # 使用wandb进行实验追踪
+    WANDB_PROJECT = "modulation-classification"  # wandb项目名称
     WANDB_ENTITY = None  # wandb实体名称
-    WANDB_NAME = None  # 实验名称
-    WANDB_NOTES = None  # 实验备注
-    WANDB_TAGS = ["modulation", "deep-learning"]  # 实验标签
-    
-    # 分布式训练参数
-    DISTRIBUTED = False  # 默认不使用分布式训练
-    WORLD_SIZE = 1  # 默认只使用1个进程
-    RANK = 0  # 默认进程排名
-    
-    # 文件路径
-    PROJECT_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 项目根目录
-    DATA_DIR = PROJECT_ROOT / 'train_data_true'  # 数据目录
-    OUTPUT_DIR = PROJECT_ROOT / 'output'  # 输出目录
-    CHECKPOINT_DIR = OUTPUT_DIR / 'checkpoints'  # 检查点目录
-    LOG_DIR = OUTPUT_DIR / 'logs'  # 日志目录
-    STATE_FILE = CHECKPOINT_DIR / "training_state.json"  # 训练状态文件
-    LAST_CHECKPOINT = CHECKPOINT_DIR / "last_checkpoint.pth"  # 最新检查点
-    BEST_CHECKPOINT = CHECKPOINT_DIR / "best_checkpoint.pth"  # 最佳检查点
-    LOG_FILE = LOG_DIR / "training.log"  # 日志文件
-    
-    # 信号参数
-    SIGNAL_LENGTH = 1024  # 信号长度
-    SAMPLE_RATE = 20e6  # 采样率
     
     def __init__(self):
         # 基础路径配置
@@ -188,31 +204,6 @@ class Config:
         # 设备配置
         self.DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 训练参数
-        self.BATCH_SIZE = 512
-        self.GRADIENT_ACCUMULATION_STEPS = 4
-        self.AMP_ENABLED = True
-        self.USE_MIXUP = True
-        self.USE_CUTMIX = True
-        
-        # 数据加载器配置
-        self.NUM_WORKERS = min(os.cpu_count(), 8)
-        self.PIN_MEMORY = True
-        self.PREFETCH_FACTOR = 2
-        
-        # wandb配置
-        self.USE_WANDB = True
-        self.WANDB_PROJECT = "modulation-classification"
-        self.WANDB_ENTITY = None
-        
-        # 集成学习配置
-        self.ENSEMBLE_MODE = 'max_confidence'  # 'max_confidence' 或 'voting'
-        self.CONFIDENCE_THRESHOLD = 0.8  # 置信度阈值
-        self.MIN_VOTE_CONFIDENCE = 0.6  # 最小投票置信度
-        self.VALIDATION_RATIO = 0.2  # 验证集比例
-        self.USE_NEGATIVE_FEEDBACK = True  # 是否使用其他分类器的否定反馈
-        self.NEGATIVE_WEIGHT = 0.3  # 否定反馈的权重
-        
         # 为每个调制类型创建检查点目录
         for mod_name in self.MODULATION_DICT.values():
             mod_checkpoint_dir = self.CHECKPOINT_DIR / mod_name
@@ -238,6 +229,69 @@ class Config:
                         state_file.unlink()
             
             print("已清理所有旧的检查点文件")
+    
+    def get_optimizer(self, model_parameters):
+        """获取优化器"""
+        if self.OPTIMIZER == 'adam':
+            return torch.optim.Adam(
+                model_parameters,
+                lr=self.LEARNING_RATE,
+                betas=(self.BETA1, self.BETA2),
+                eps=self.EPS,
+                weight_decay=self.WEIGHT_DECAY
+            )
+        elif self.OPTIMIZER == 'adamw':
+            return torch.optim.AdamW(
+                model_parameters,
+                lr=self.LEARNING_RATE,
+                betas=(self.BETA1, self.BETA2),
+                eps=self.EPS,
+                weight_decay=self.WEIGHT_DECAY
+            )
+        elif self.OPTIMIZER == 'sgd':
+            return torch.optim.SGD(
+                model_parameters,
+                lr=self.LEARNING_RATE,
+                momentum=self.MOMENTUM,
+                weight_decay=self.WEIGHT_DECAY,
+                nesterov=True
+            )
+        else:
+            raise ValueError(f"不支持的优化器类型: {self.OPTIMIZER}")
+    
+    def get_lr_scheduler(self, optimizer):
+        """获取学习率调度器"""
+        if self.LR_SCHEDULER == 'cosine':
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.MAX_EPOCHS,
+                eta_min=self.MIN_LEARNING_RATE
+            )
+        elif self.LR_SCHEDULER == 'step':
+            return torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=self.LR_STEP_SIZE,
+                gamma=self.LR_DECAY_RATE
+            )
+        elif self.LR_SCHEDULER == 'plateau':
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=self.LR_DECAY_RATE,
+                patience=5,
+                verbose=True
+            )
+        elif self.LR_SCHEDULER == 'onecycle':
+            return torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=self.MAX_LR,
+                epochs=self.MAX_EPOCHS,
+                steps_per_epoch=1000,  # 这个值需要根据实际的每轮步数设置
+                pct_start=0.3,
+                anneal_strategy='cos'
+            )
+        else:
+            return None
     
     def load_training_state(self):
         """加载训练状态"""
@@ -271,79 +325,6 @@ class Config:
         with open(self.STATE_FILE, 'w') as f:
             json.dump(state, f, indent=4)
         print(f"保存训练状态：当前第{state['current_epoch']}轮")
-    
-    def get_optimizer(self, model_parameters):
-        """获取优化器"""
-        if self.OPTIMIZER == 'adam':
-            return torch.optim.Adam(
-                model_parameters,
-                lr=self.LEARNING_RATE,
-                betas=(self.BETA1, self.BETA2),
-                eps=self.EPS,
-                weight_decay=self.WEIGHT_DECAY
-            )
-        elif self.OPTIMIZER == 'adamw':
-            return torch.optim.AdamW(
-                model_parameters,
-                lr=self.LEARNING_RATE,
-                betas=(self.BETA1, self.BETA2),
-                eps=self.EPS,
-                weight_decay=self.WEIGHT_DECAY
-            )
-        elif self.OPTIMIZER == 'sgd':
-            return torch.optim.SGD(
-                model_parameters,
-                lr=self.LEARNING_RATE,
-                momentum=self.MOMENTUM,
-                weight_decay=self.WEIGHT_DECAY,
-                nesterov=True
-            )
-        else:
-            raise ValueError(f"不支持的优化器类型: {self.OPTIMIZER}")
-    
-    def get_lr_scheduler(self, optimizer):
-        """获取学习率调度器"""
-        if self.LR_SCHEDULER == 'one_cycle':
-            return torch.optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=self.MAX_LR,
-                epochs=self.MAX_EPOCHS,
-                steps_per_epoch=1000,  # 根据实际情况调整
-                pct_start=0.3,
-                anneal_strategy='cos',
-                div_factor=25.0,
-                final_div_factor=1000.0
-            )
-        elif self.LR_SCHEDULER == 'cosine':
-            return torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=self.MAX_EPOCHS,
-                eta_min=self.MIN_LEARNING_RATE,
-                last_epoch=self.training_state['current_epoch'] - 1
-            )
-        elif self.LR_SCHEDULER == 'cosine_warm':
-            return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                optimizer,
-                T_0=10,  # 第一次重启的epoch数
-                T_mult=2,  # 每次重启后周期乘数
-                eta_min=self.MIN_LEARNING_RATE
-            )
-        elif self.LR_SCHEDULER == 'step':
-            return torch.optim.lr_scheduler.StepLR(
-                optimizer,
-                step_size=self.LR_STEP_SIZE,
-                gamma=self.LR_DECAY_RATE
-            )
-        elif self.LR_SCHEDULER == 'plateau':
-            return torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='max',
-                factor=0.1,
-                patience=5,
-                verbose=True,
-                min_lr=self.MIN_LEARNING_RATE
-            )
-        return None
     
     def should_stop_early(self, current_score):
         """检查是否应该早停"""

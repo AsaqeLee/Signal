@@ -6,133 +6,141 @@ import pickle
 import logging
 from project.config import Config
 import pandas as pd
+from torchvision.transforms import Compose
 
 class ModulationDataset(Dataset):
-    def __init__(self, transform=None):
-        self.config = Config()
+    """调制信号数据集"""
+    def __init__(self, data_dir, transform=None, sequence_length=2048):
+        super().__init__()
+        self.data_dir = Path(data_dir)
         self.transform = transform
-        self.logger = logging.getLogger(__name__)
+        self.sequence_length = sequence_length
+        self.samples = []
         
-        # 加载数据
-        self.data = []
-        self.labels = []
-        self.symbol_widths = []
-        
-        self._load_data()
-        
-    def _load_data(self):
-        """加载和预处理数据"""
-        try:
-            total_files = 0
-            valid_files = 0
+        # 加载所有数据文件
+        for mod_type, mod_name in Config.MODULATION_DICT.items():
+            mod_dir = self.data_dir / mod_name
+            if not mod_dir.exists():
+                raise RuntimeError(f"调制类型目录不存在: {mod_dir}")
             
-            for mod_type, mod_name in self.config.MODULATION_DICT.items():
-                mod_dir = self.config.DATA_DIR / mod_name
-                if not mod_dir.exists():
-                    self.logger.warning(f"目录不存在: {mod_dir}")
-                    continue
-                
-                files = list(mod_dir.glob("*.csv"))
-                total_files += len(files)
-                self.logger.info(f"在 {mod_name} 目录中找到 {len(files)} 个文件")
-                
-                for file_path in files:
-                    try:
-                        # 读取CSV文件，不使用header
-                        df = pd.read_csv(file_path, header=None, dtype=float)
-                        
-                        # 基本验证
-                        if df.shape[1] < 5:
-                            self.logger.warning(f"文件列数不足: {file_path}")
-                            continue
-                            
-                        if df.empty:
-                            self.logger.warning(f"文件为空: {file_path}")
-                            continue
-                        
-                        # 获取IQ数据
-                        i_data = df.iloc[:, 0].values
-                        q_data = df.iloc[:, 1].values
-                        
-                        # 检查数据有效性
-                        if np.any(np.isnan(i_data)) or np.any(np.isnan(q_data)):
-                            self.logger.warning(f"文件包含NaN值: {file_path}")
-                            continue
-                            
-                        if np.any(np.isinf(i_data)) or np.any(np.isinf(q_data)):
-                            self.logger.warning(f"文件包含Inf值: {file_path}")
-                            continue
-                        
-                        signal = np.stack([i_data, q_data], axis=0)
-                        
-                        # 获取标签信息 - 使用第一行的值
-                        try:
-                            file_mod_type = int(df.iloc[0, 3])  # 调制类型
-                            symbol_width = float(df.iloc[0, 4])  # 码元宽度
-                            
-                            # 验证调制类型是否匹配
-                            if file_mod_type != mod_type:
-                                self.logger.warning(f"调制类型不匹配 {file_path}: 期望 {mod_type}, 实际 {file_mod_type}")
-                                continue
-                                
-                        except (ValueError, TypeError) as e:
-                            self.logger.warning(f"标签转换失败 {file_path}: {str(e)}")
-                            continue
-                        
-                        # 验证码元宽度
-                        if symbol_width <= 0:
-                            self.logger.warning(f"无效的码元宽度 {symbol_width}: {file_path}")
-                            continue
-                        
-                        # 确保信号长度一致
-                        if signal.shape[1] > self.config.SIGNAL_LENGTH:
-                            signal = signal[:, :self.config.SIGNAL_LENGTH]
-                        elif signal.shape[1] < self.config.SIGNAL_LENGTH:
-                            pad_width = ((0, 0), (0, self.config.SIGNAL_LENGTH - signal.shape[1]))
-                            signal = np.pad(signal, pad_width, mode='constant')
-                        
-                        self.data.append(signal)
-                        self.labels.append(mod_type)  # 使用原始调制类型索引
-                        self.symbol_widths.append(symbol_width)
-                        valid_files += 1
-                        
-                    except Exception as e:
-                        self.logger.error(f"加载文件失败 {file_path}: {str(e)}")
-                        continue
-            
-            if valid_files == 0:
-                raise RuntimeError("没有找到有效的数据文件")
-            
-            self.data = np.array(self.data)
-            self.labels = np.array(self.labels)
-            self.symbol_widths = np.array(self.symbol_widths)
-            
-            self.logger.info(f"\n=== 数据加载统计 ===")
-            self.logger.info(f"总文件数: {total_files}")
-            self.logger.info(f"有效文件数: {valid_files}")
-            self.logger.info(f"有效率: {valid_files/total_files*100:.2f}%\n")
-            
-            for mod_type, mod_name in self.config.MODULATION_DICT.items():
-                count = np.sum(self.labels == mod_type)
-                self.logger.info(f"{mod_name}: {count} 个样本")
-                
-        except Exception as e:
-            self.logger.error(f"加载数据集失败: {str(e)}")
-            raise
+            for file_path in mod_dir.glob("*.csv"):
+                self.samples.append({
+                    'path': file_path,
+                    'modulation_type': mod_type,
+                    'mod_name': mod_name
+                })
     
     def __len__(self):
-        return len(self.data)
+        return len(self.samples)
     
     def __getitem__(self, idx):
-        signal = torch.from_numpy(self.data[idx]).float()
-        label = self.labels[idx]
-        symbol_width = self.symbol_widths[idx]
+        sample = self.samples[idx]
         
-        if self.transform:
-            signal = self.transform(signal)
+        # 读取IQ数据
+        df = pd.read_csv(sample['path'], header=None)
+        i_data = df[0].values
+        q_data = df[1].values
+        
+        # 统一序列长度
+        if len(i_data) > self.sequence_length:
+            # 如果序列太长，随机选择一个起点进行裁剪
+            start_idx = np.random.randint(0, len(i_data) - self.sequence_length)
+            i_data = i_data[start_idx:start_idx + self.sequence_length]
+            q_data = q_data[start_idx:start_idx + self.sequence_length]
+        elif len(i_data) < self.sequence_length:
+            # 如果序列太短，使用循环填充
+            i_data = np.resize(i_data, self.sequence_length)
+            q_data = np.resize(q_data, self.sequence_length)
+        
+        # 转换为张量
+        iq_data = torch.tensor([i_data, q_data], dtype=torch.float32)
+        
+        # 应用数据变换
+        if self.transform is not None:
+            iq_data = self.transform(iq_data)
+        
+        # 数据归一化
+        iq_mean = iq_data.mean(dim=1, keepdim=True)
+        iq_std = iq_data.std(dim=1, keepdim=True)
+        iq_data = (iq_data - iq_mean) / (iq_std + 1e-6)
+        
+        # 创建标签张量
+        modulation_type = torch.tensor(sample['modulation_type'] - 1, dtype=torch.long)
         
         return {
-            'data': signal,
-            'modulation_type': label,
-            'symbol_width': symbol_width
-        } 
+            'data': iq_data,
+            'targets': {
+                'modulation_type': modulation_type,
+                'mod_name': sample['modulation_type'] - 1  # 直接使用数字索引而不是字符串
+            }
+        }
+    
+    @staticmethod
+    def get_transforms(config, mode='train'):
+        """获取数据变换"""
+        transforms = []
+        
+        if mode == 'train':
+            if config.USE_MIXUP:
+                transforms.append(Mixup(alpha=config.MIXUP_ALPHA))
+            if config.USE_CUTMIX:
+                transforms.append(CutMix(alpha=config.CUTMIX_ALPHA))
+        
+        return Compose(transforms) if transforms else None
+
+class Mixup:
+    """Mixup数据增强"""
+    def __init__(self, alpha=0.2):
+        self.alpha = alpha
+    
+    def __call__(self, x):
+        if self.alpha <= 0:
+            return x
+        
+        # 生成混合权重
+        lam = np.random.beta(self.alpha, self.alpha)
+        
+        # 创建混合数据
+        mixed_x = lam * x
+        
+        # 随机打乱IQ数据
+        perm = torch.randperm(2)
+        mixed_x = mixed_x + (1 - lam) * x[perm]
+        
+        return mixed_x
+
+class CutMix:
+    """CutMix数据增强"""
+    def __init__(self, alpha=1.0):
+        self.alpha = alpha
+    
+    def __call__(self, x):
+        if self.alpha <= 0:
+            return x
+        
+        # 生成混合权重
+        lam = np.random.beta(self.alpha, self.alpha)
+        
+        # 计算裁剪区域
+        seq_len = x.size(1)  # IQ数据的序列长度
+        cut_len = int(seq_len * (1 - lam))
+        cut_start = np.random.randint(0, seq_len - cut_len)
+        
+        # 创建混合数据
+        mixed_x = x.clone()
+        
+        # 随机打乱IQ数据
+        perm = torch.randperm(2)
+        mixed_x[:, cut_start:cut_start+cut_len] = x[perm, cut_start:cut_start+cut_len]
+        
+        return mixed_x
+
+class Compose:
+    """组合多个数据变换"""
+    def __init__(self, transforms):
+        self.transforms = transforms
+    
+    def __call__(self, x):
+        for t in self.transforms:
+            x = t(x)
+        return x

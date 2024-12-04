@@ -74,34 +74,97 @@ class ResidualBlock(nn.Module):
         out = F.relu(out)
         return out
 
-class ModulationClassifier(BaseModel):
-    def __init__(self):
-        super().__init__()
+class BinaryModulationClassifier(BaseModel):
+    """二分类调制分类器"""
+    def __init__(self, config):
+        super().__init__(config)
+        
+        # 特征提取层
+        self.features = nn.Sequential(
+            # 第一层卷积
+            nn.Conv1d(2, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(2),
+            
+            # 第二层卷积
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(2),
+            
+            # 第三层卷积
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(2),
+            
+            # 第四层卷积
+            nn.Conv1d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(2),
+            
+            # 全局平均池化
+            nn.AdaptiveAvgPool1d(1)
+        )
+        
+        # 分类头
+        self.classifier = nn.Sequential(
+            nn.Linear(512, self.config.FEATURE_DIM),
+            nn.ReLU(inplace=True),
+            nn.Dropout(self.config.DROPOUT_RATE),
+            nn.Linear(self.config.FEATURE_DIM, 1)
+        )
+        
+        # 初始化权重
+        self._initialize_weights()
+    
+    def forward(self, x):
+        # 特征提取
+        features = self.features(x)
+        features = features.squeeze(-1)
+        
+        # 分类预测
+        logits = self.classifier(features)
+        
+        return {
+            'logits': logits.squeeze(-1)
+        }
+
+class SymbolWidthRegressor(BaseModel):
+    """码元宽度回归模型"""
+    def __init__(self, config):
+        super().__init__(config)
         
         # 特征提取
         self.features = nn.Sequential(
             # 第一层卷积块
             nn.Conv1d(2, 64, kernel_size=7, padding=3),
             nn.BatchNorm1d(64),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
             nn.MaxPool1d(2),
             
             # 第二层卷积块
             nn.Conv1d(64, 128, kernel_size=5, padding=2),
             nn.BatchNorm1d(128),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
             nn.MaxPool1d(2),
             
             # 第三层卷积块
             nn.Conv1d(128, 256, kernel_size=3, padding=1),
             nn.BatchNorm1d(256),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
             nn.MaxPool1d(2),
             
             # 第四层卷积块
             nn.Conv1d(256, 512, kernel_size=3, padding=1),
             nn.BatchNorm1d(512),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
             nn.MaxPool1d(2),
             
             # 注意力层
@@ -109,160 +172,116 @@ class ModulationClassifier(BaseModel):
             nn.AdaptiveAvgPool1d(1)
         )
         
-        # 调制类型分类
-        self.modulation_classifier = nn.Sequential(
-            nn.Linear(512, self.config.FEATURE_DIM),
-            nn.BatchNorm1d(self.config.FEATURE_DIM),
-            nn.ReLU(),
-            nn.Dropout(self.config.DROPOUT_RATE),
-            nn.Linear(self.config.FEATURE_DIM, self.config.NUM_CLASSES)
-        )
-        
-        # 码元宽度预测
-        self.width_regressor = nn.Sequential(
-            nn.Linear(512, self.config.FEATURE_DIM),
-            nn.BatchNorm1d(self.config.FEATURE_DIM),
-            nn.ReLU(),
-            nn.Dropout(self.config.DROPOUT_RATE),
-            nn.Linear(self.config.FEATURE_DIM, 1),
-            nn.Softplus()  # 确保输出为正值
+        # 回归器
+        self.regressor = nn.Sequential(
+            nn.Linear(512, config.FEATURE_DIM),
+            nn.BatchNorm1d(config.FEATURE_DIM),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(config.FEATURE_DIM, config.FEATURE_DIM // 2),
+            nn.BatchNorm1d(config.FEATURE_DIM // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(config.FEATURE_DIM // 2, 1),
+            nn.Softplus()  # 确保输出为正数
         )
         
         # 初始化权重
         self._initialize_weights()
     
-    def _initialize_weights(self):
-        """初始化模型权重"""
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                # 使用较小的标准差进行初始化
-                nn.init.normal_(m.weight, mean=0.0, std=0.01)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-                    
     def forward(self, x):
         # 特征提取
-        x = self.features(x)  # 输出形状: [batch_size, channels, 1]
-        x = x.squeeze(-1)     # 移除最后一个维度，变为 [batch_size, channels]
+        x = self.features(x)
+        x = x.squeeze(-1)
         
-        # 预测
-        mod_logits = self.modulation_classifier(x)
-        width_pred = self.width_regressor(x)
+        # 回归预测
+        pred = self.regressor(x)
         
         return {
-            'modulation_type': mod_logits,  # 不要在这里应用softmax
-            'symbol_width': width_pred
+            'symbol_width': pred.squeeze()
         }
-    
-    def get_loss_function(self):
-        """获取损失函数"""
-        def criterion(outputs, targets):
-            # 调制类型损失（带标签平滑和焦点损失的组合）
-            mod_loss = self._focal_loss_with_smoothing(
-                outputs['modulation_type'],
-                targets['modulation_type'],
-                smoothing=0.1,
-                gamma=2.0
-            )
-            
-            # 码元宽度损失（相对误差 + Huber损失的组合）
-            width_loss = self._width_loss(
-                outputs['symbol_width'].squeeze(),
-                targets['symbol_width']
-            )
-            
-            # 总损失
-            total_loss = (
-                self.config.MT_WEIGHT * mod_loss +
-                self.config.SW_WEIGHT * width_loss
-            )
-            
-            return total_loss
-        
-        return criterion
-    
-    def _focal_loss_with_smoothing(self, pred, target, smoothing=0.1, gamma=2.0):
-        """带标签平滑的焦点损失"""
-        n_classes = pred.size(1)
-        
-        # 标签平滑
-        one_hot = torch.zeros_like(pred).scatter(1, target.unsqueeze(1), 1)
-        smooth_one_hot = one_hot * (1 - smoothing) + smoothing / n_classes
-        
-        # 计算概率
-        probs = F.softmax(pred, dim=1)
-        log_probs = F.log_softmax(pred, dim=1)
-        
-        # 焦点损失
-        pt = (smooth_one_hot * probs).sum(dim=1)
-        focal_weight = (1 - pt) ** gamma
-        
-        loss = (-smooth_one_hot * log_probs).sum(dim=1)
-        focal_loss = focal_weight * loss
-        
-        return focal_loss.mean()
-    
-    def _width_loss(self, pred, target, beta=0.1):
-        """组合码元宽度损失"""
-        # 相对误差
-        relative_error = torch.abs(pred - target) / target
-        
-        # Huber损失
-        huber_loss = F.smooth_l1_loss(pred, target, beta=beta)
-        
-        # L1正则化
-        l1_reg = torch.abs(pred).mean()
-        
-        # 组合损失
-        return relative_error.mean() + huber_loss + 0.01 * l1_reg
 
 class ModulationClassifierEnsemble(BaseModel):
     """调制分类器集成模型"""
-    def __init__(self):
-        super().__init__()
+    def __init__(self, config=None):
+        super().__init__(config)
         self.classifiers = nn.ModuleDict()
         
-        # 为每种调制类型创建一个分类器
+        # 为每种调制类型创建一个二分类器
         for mod_type, mod_name in self.config.MODULATION_DICT.items():
-            classifier = ModulationClassifier()
-            # 修改最后的分类层为二分类
-            classifier.modulation_classifier[-1] = nn.Linear(self.config.FEATURE_DIM, 1)
+            classifier = BinaryModulationClassifier(self.config)
             self.classifiers[mod_name] = classifier
+        
+        # 初始化温度参数（可训练）
+        if self.config.USE_TEMPERATURE_SCALING:
+            self.temperature = nn.Parameter(torch.ones(1) * self.config.TEMPERATURE)
     
     def forward(self, x):
         # 收集每个分类器的预测结果
         predictions = {}
         confidences = {}
+        raw_outputs = {}
         
         for mod_name, classifier in self.classifiers.items():
             # 获取每个分类器的预测
             outputs = classifier(x)
-            pred = torch.sigmoid(outputs['modulation_type'])  # 使用sigmoid获取置信度
-            predictions[mod_name] = pred
-            confidences[mod_name] = pred.mean()  # 使用平均置信度
+            logits = outputs['logits']
+            
+            # 应用温度缩放
+            if self.config.USE_TEMPERATURE_SCALING:
+                scaled_logits = logits / self.temperature
+                probs = torch.sigmoid(scaled_logits)
+            else:
+                probs = torch.sigmoid(logits)
+            
+            predictions[mod_name] = (probs > self.config.CONFIDENCE_THRESHOLD)
+            confidences[mod_name] = probs
+            raw_outputs[mod_name] = logits
         
-        # 找到置信度最高的预测
-        max_confidence = -float('inf')
+        # 计算一致性得分
+        consistency_scores = {}
+        if self.config.USE_CONSISTENCY_SCORE:
+            for mod_name in self.config.MODULATION_DICT.values():
+                other_scores = []
+                for other_name, other_conf in confidences.items():
+                    if other_name != mod_name:
+                        agreement = 1 - torch.abs(confidences[mod_name] - (1 - other_conf)).mean()
+                        other_scores.append(agreement)
+                
+                if other_scores:
+                    consistency_scores[mod_name] = torch.stack(other_scores).mean()
+                else:
+                    consistency_scores[mod_name] = torch.tensor(0.0).to(x.device)
+        
+        # 计算最终得分
+        final_scores = {}
+        for mod_name in self.config.MODULATION_DICT.values():
+            base_confidence = confidences[mod_name].mean()
+            
+            if self.config.USE_CONSISTENCY_SCORE:
+                consistency = consistency_scores[mod_name]
+                # 结合置信度和一致性得分
+                final_scores[mod_name] = base_confidence * (0.7 + 0.3 * consistency)
+            else:
+                final_scores[mod_name] = base_confidence
+        
+        # 找到最高得分的预测
+        max_score = -float('inf')
         predicted_mod = None
         
-        for mod_name, confidence in confidences.items():
-            if confidence > max_confidence:
-                max_confidence = confidence
+        for mod_name, score in final_scores.items():
+            if score > max_score:
+                max_score = score
                 predicted_mod = mod_name
         
-        # 返回预测结果和置信度
         return {
             'predictions': predictions,
             'confidences': confidences,
+            'raw_outputs': raw_outputs,
+            'consistency_scores': consistency_scores if self.config.USE_CONSISTENCY_SCORE else None,
+            'final_scores': final_scores,
             'predicted_mod': predicted_mod,
-            'max_confidence': max_confidence
+            'max_confidence': max_score
         }
     
     def train_single_classifier(self, mod_name, data, targets):
@@ -270,19 +289,62 @@ class ModulationClassifierEnsemble(BaseModel):
         classifier = self.classifiers[mod_name]
         outputs = classifier(data)
         
-        # 计算二分类损失
+        # 使用binary_cross_entropy_with_logits
         loss = F.binary_cross_entropy_with_logits(
-            outputs['modulation_type'],
-            (targets['modulation_type'] == self.config.MODULATION_DICT.index(mod_name)).float()
+            outputs['logits'],
+            targets['modulation_type']
         )
         
         return loss
+    
+    def calibrate_temperature(self, val_loader):
+        """使用验证集校准温度参数"""
+        if not self.config.USE_TEMPERATURE_SCALING:
+            return
+        
+        self.eval()
+        nll_criterion = nn.CrossEntropyLoss()
+        
+        logits_list = []
+        labels_list = []
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                data = batch['data'].to(self.config.DEVICE)
+                labels = batch['modulation_type'].to(self.config.DEVICE)
+                
+                outputs = self(data)
+                # 收集所有分类器的logits
+                for mod_name, logits in outputs['raw_outputs'].items():
+                    logits_list.append(logits)
+                    labels_list.append((labels == self.config.MODULATION_DICT.index(mod_name)).float())
+        
+        logits = torch.cat(logits_list)
+        labels = torch.cat(labels_list)
+        
+        # 优化温度参数
+        optimizer = torch.optim.LBFGS([self.temperature], lr=0.01, max_iter=50)
+        
+        def eval():
+            optimizer.zero_grad()
+            loss = nll_criterion(logits / self.temperature, labels)
+            loss.backward()
+            return loss
+        
+        optimizer.step(eval)
+        
+        print(f"校准后的温度参数: {self.temperature.item():.3f}")
     
     def save_classifiers(self, path):
         """保存所有分类器"""
         for mod_name, classifier in self.classifiers.items():
             save_path = path / f"{mod_name}_classifier.pth"
             classifier.save_model(str(save_path))
+        
+        # 保存温度参数
+        if self.config.USE_TEMPERATURE_SCALING:
+            temp_path = path / "temperature.pth"
+            torch.save({'temperature': self.temperature}, str(temp_path))
     
     def load_classifiers(self, path):
         """加载所有分类器"""
@@ -290,3 +352,10 @@ class ModulationClassifierEnsemble(BaseModel):
             load_path = path / f"{mod_name}_classifier.pth"
             if load_path.exists():
                 classifier.load_model(str(load_path))
+        
+        # 加载温度参数
+        if self.config.USE_TEMPERATURE_SCALING:
+            temp_path = path / "temperature.pth"
+            if temp_path.exists():
+                temp_state = torch.load(str(temp_path))
+                self.temperature.data = temp_state['temperature']
