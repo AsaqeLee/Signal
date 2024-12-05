@@ -1,546 +1,642 @@
+import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 import numpy as np
 from pathlib import Path
-import json
 import logging
-from tqdm import tqdm
 import wandb
-import os
+from tqdm import tqdm
 from datetime import datetime
-import traceback
-import sys
-import torch.nn.functional as F
+from typing import Dict, Any, List, Union, Tuple, Optional
 
 from project.config import Config
-from project.data.dataset import ModulationDataset
-from project.model.modulation_classifier import ModulationClassifierEnsemble
-from project.utils.metrics import calculate_metrics
+from project.data.dataset import MultiTaskSignalDataset
+from project.model.multi_task_model import MultiTaskModel
+from project.utils.metrics import calculate_modulation_metrics, calculate_symbol_width_metrics, calculate_symbol_sequence_metrics
 from project.utils.early_stopping import EarlyStopping
 
-def setup_logging(config):
-    """设置日志系统"""
-    # 创建日志文件名
+def calculate_scores(
+    outputs: Dict[str, torch.Tensor],
+    targets: Dict[str, torch.Tensor],
+    config: Config
+) -> Dict[str, float]:
+    """计算各个任务的评分"""
+    scores = {}
+    details = {}
+    
+    # 1. 调制分类评分 (MT_score)
+    mod_pred = outputs['modulation_type'].argmax(dim=1)
+    mod_correct = (mod_pred == targets['modulation_type'])
+    mod_accuracy = mod_correct.float().mean().item() * 100  # 转换为百分比
+    scores['mt_score'] = mod_accuracy
+    
+    # 计算每种调制类型的准确率
+    details['mod_type_accuracy'] = {}
+    for mod_type, mod_name in config.MODULATION_DICT.items():
+        mod_type_mask = targets['modulation_type'] == (mod_type - 1)  # 转换为0-based索引
+        if mod_type_mask.any():
+            type_correct = mod_correct[mod_type_mask]
+            type_accuracy = type_correct.float().mean().item() * 100
+            details['mod_type_accuracy'][mod_name] = type_accuracy
+    
+    # 2. 码元宽度评分 (SW_score)
+    width_error = torch.abs(
+        outputs['symbol_width'].squeeze(1) -
+        targets['symbol_width']
+    ) / targets['symbol_width']
+    
+    width_correct = width_error <= config.SW_THRESHOLDS['acceptable']
+    width_accuracy = width_correct.float().mean().item() * 100
+    
+    # 记录码元宽度的预测值和实际值
+    details['symbol_width'] = {
+        'predictions': outputs['symbol_width'].squeeze(1).detach().cpu().numpy().tolist(),
+        'targets': targets['symbol_width'].detach().cpu().numpy().tolist(),
+        'errors': width_error.detach().cpu().numpy().tolist()
+    }
+    
+    width_scores = torch.zeros_like(width_error)
+    width_scores[width_error <= config.SW_THRESHOLDS['perfect']] = 100
+    mask = (width_error > config.SW_THRESHOLDS['perfect']) & (width_error <= config.SW_THRESHOLDS['acceptable'])
+    width_scores[mask] = (1 - (width_error[mask] - config.SW_THRESHOLDS['perfect']) / 
+                        (config.SW_THRESHOLDS['acceptable'] - config.SW_THRESHOLDS['perfect'])) * 100
+    scores['sw_score'] = width_scores.mean().item()
+    
+    # 3. 码元序列评分 (CQ_score)
+    # 只有当调制类型和码元宽度的准确率都超过80%时才计算序列相似度
+    if mod_accuracy >= 80 and width_accuracy >= 80:
+        # 获取同时满足调制类型和码元宽度正确的样本
+        valid_mask = mod_correct & width_correct
+        
+        if valid_mask.any():
+            # 获取预测和目标序列
+            pred_seq = outputs['symbol_sequence'].squeeze(1)[valid_mask]  # [N, L]
+            true_seq = targets['symbol_sequence'][valid_mask]  # [N, L]
+            
+            # 确保序列长度一致
+            min_length = min(pred_seq.size(1), true_seq.size(1))
+            pred_seq = pred_seq[:, :min_length]
+            true_seq = true_seq[:, :min_length]
+            
+            # 计算余弦似度
+            cos_sim = F.cosine_similarity(pred_seq, true_seq, dim=1).abs()
+            
+            # 计算分数
+            seq_scores = torch.zeros_like(cos_sim)
+            seq_scores[cos_sim >= config.CQ_THRESHOLDS['perfect']] = 100
+            mask = (cos_sim >= config.CQ_THRESHOLDS['acceptable']) & (cos_sim < config.CQ_THRESHOLDS['perfect'])
+            seq_scores[mask] = ((cos_sim[mask] - config.CQ_THRESHOLDS['acceptable']) / 
+                              (config.CQ_THRESHOLDS['perfect'] - config.CQ_THRESHOLDS['acceptable'])) * 100
+            scores['cq_score'] = seq_scores.mean().item()
+            
+            # 记录序列相似度
+            details['sequence_similarity'] = cos_sim.detach().cpu().numpy().tolist()
+        else:
+            scores['cq_score'] = 0.0
+    else:
+        scores['cq_score'] = 0.0
+    
+    # 4. 计算总分
+    # 根据准确率阈值调整权重
+    if mod_accuracy >= 80 and width_accuracy >= 80:
+        # 当准确率达标时,增加序列预测的权重
+        scores['total_score'] = (
+            0.3 * scores['mt_score'] +    # 保持调制分类的权重
+            0.3 * scores['sw_score'] +    # 保持码元宽度的权重
+            0.4 * scores['cq_score']      # 增加序列预测的权重
+        )
+    else:
+        # 当确率未达标时,只关注调制分类和码元宽度
+        scores['total_score'] = (
+            0.5 * scores['mt_score'] +    # 增加调制分类的权重
+            0.5 * scores['sw_score']      # 增加码元宽度的权重
+        )
+    
+    return scores, details
+
+def train_one_epoch(
+    model: nn.Module,
+    train_loader: DataLoader,
+    criterion: callable,
+    optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler._LRScheduler,
+    config: Config,
+    epoch: int,
+    scaler: torch.cuda.amp.GradScaler = None
+) -> Dict[str, float]:
+    """训练一个epoch"""
+    model.train()
+    total_loss = 0
+    score_sums = {'mt_score': 0, 'sw_score': 0, 'cq_score': 0, 'total_score': 0}
+    num_batches = len(train_loader)
+    
+    # 使用tqdm显示进度
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
+    
+    for batch_idx, batch in enumerate(pbar):
+        # 获取数据和标签
+        data = batch['data'].to(config.DEVICE)
+        targets = {k: v.to(config.DEVICE) for k, v in batch['targets'].items()}
+        
+        # 清零梯度
+        optimizer.zero_grad()
+        
+        # 前向传播
+        if config.AMP_ENABLED and scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs = model({'data': data, 'targets': targets})
+                loss_dict = criterion(outputs, targets)
+                loss = loss_dict['total_loss']
+                
+            # 反向传播
+            scaler.scale(loss).backward()
+            
+            # 梯度累积
+            if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+                # 梯度裁剪
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRADIENT_CLIP_VAL)
+                
+                # 优化器步进
+                scaler.step(optimizer)
+                scaler.update()
+                
+                # 学习率调度
+                if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
+                    scheduler.step()
+        else:
+            # 常规训练
+            outputs = model({'data': data, 'targets': targets})
+            loss_dict = criterion(outputs, targets)
+            loss = loss_dict['total_loss']
+            loss.backward()
+            
+            # 梯度累积
+            if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRADIENT_CLIP_VAL)
+                optimizer.step()
+                optimizer.zero_grad()
+                
+                # 习率调度
+                if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
+                    scheduler.step()
+        
+        # 计算各项评分
+        scores, details = calculate_scores(outputs, targets, config)
+        for k, v in scores.items():
+            score_sums[k] += v
+        
+        total_loss += loss.item()
+        
+        # 更新进度条
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'mt_score': f'{scores["mt_score"]:.1f}',
+            'sw_score': f'{scores["sw_score"]:.1f}',
+            'cq_score': f'{scores["cq_score"]:.1f}',
+            'total': f'{scores["total_score"]:.1f}',
+            'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
+        })
+        
+        # 记录到wandb和日志
+        if (batch_idx + 1) % config.LOG_INTERVAL == 0:
+            # 记录基本指标
+            log_dict = {
+                'train_batch_loss': loss.item(),
+                'train_batch_mt_loss': loss_dict['modulation_loss'].item(),
+                'train_batch_sw_loss': loss_dict['width_loss'].item(),
+                'train_batch_cq_loss': loss_dict['sequence_loss'].item(),
+                'train_batch_mt_score': scores['mt_score'],
+                'train_batch_sw_score': scores['sw_score'],
+                'train_batch_cq_score': scores['cq_score'],
+                'train_batch_total_score': scores['total_score'],
+                'learning_rate': optimizer.param_groups[0]['lr']
+            }
+            
+            # 记录每种调制类型的准确率
+            for mod_name, accuracy in details['mod_type_accuracy'].items():
+                log_dict[f'train_batch_accuracy_{mod_name}'] = accuracy
+            
+            # 记录码元宽度统计信息
+            width_errors = np.array(details['symbol_width']['errors'])
+            log_dict.update({
+                'train_batch_width_error_mean': width_errors.mean(),
+                'train_batch_width_error_std': width_errors.std(),
+                'train_batch_width_error_max': width_errors.max(),
+                'train_batch_width_error_min': width_errors.min()
+            })
+            
+            if config.USE_WANDB:
+                wandb.log(log_dict)
+            
+            # 输出详细日志
+            logging.info(f"\nBatch {batch_idx + 1}/{num_batches}")
+            logging.info("调制类型准确率:")
+            for mod_name, accuracy in details['mod_type_accuracy'].items():
+                logging.info(f"  {mod_name}: {accuracy:.2f}%")
+            logging.info(f"码元宽度误差统计:")
+            logging.info(f"  平均误差: {width_errors.mean():.4f}")
+            logging.info(f"  最大误差: {width_errors.max():.4f}")
+            logging.info(f"  最小误差: {width_errors.min():.4f}")
+            if 'sequence_similarity' in details:
+                sim = np.array(details['sequence_similarity'])
+                logging.info(f"序列相似度统计:")
+                logging.info(f"  平均相似度: {sim.mean():.4f}")
+                logging.info(f"  最大相似度: {sim.max():.4f}")
+                logging.info(f"  最小相似度: {sim.min():.4f}")
+    
+    # 计算平均值
+    avg_loss = total_loss / num_batches
+    avg_scores = {k: v / num_batches for k, v in score_sums.items()}
+    
+    return {'loss': avg_loss, **avg_scores}
+
+def validate(
+    model: nn.Module,
+    val_loader: DataLoader,
+    criterion: callable,
+    config: Config
+) -> Dict[str, float]:
+    """验证模型性能"""
+    model.eval()
+    total_loss = 0
+    score_sums = {'mt_score': 0, 'sw_score': 0, 'cq_score': 0, 'total_score': 0}
+    num_batches = len(val_loader)
+    
+    # 用于计算详细指标
+    all_mod_preds = []
+    all_mod_targets = []
+    all_width_errors = []
+    all_seq_sims = []
+    
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc='Validating'):
+            data = batch['data'].to(config.DEVICE)
+            targets = {k: v.to(config.DEVICE) for k, v in batch['targets'].items()}
+            
+            outputs = model({'data': data, 'targets': targets})
+            loss_dict = criterion(outputs, targets)
+            loss = loss_dict['total_loss']
+            
+            # 计算各项评分
+            scores, details = calculate_scores(outputs, targets, config)
+            for k, v in scores.items():
+                score_sums[k] += v
+            
+            total_loss += loss.item()
+            
+            # 收集详指标数据
+            all_mod_preds.append(outputs['modulation_type'].argmax(dim=1).cpu())
+            all_mod_targets.append(targets['modulation_type'].cpu())
+            
+            # 只收集调制类型正确的样本的码元宽度误差
+            mod_correct = (outputs['modulation_type'].argmax(dim=1) == targets['modulation_type'])
+            if mod_correct.any():
+                width_error = torch.abs(
+                    outputs['symbol_width'][mod_correct].squeeze(1) -
+                    targets['symbol_width'][mod_correct]
+                ) / targets['symbol_width'][mod_correct]
+                all_width_errors.append(width_error.cpu())
+                
+                # 只收集调制类型和码元宽度都正确的样本的序列相似度
+                width_correct = width_error <= config.SW_THRESHOLDS['acceptable']
+                if width_correct.any():
+                    valid_mask = mod_correct.clone()
+                    valid_mask[mod_correct] = width_correct
+                    if valid_mask.any():
+                        # 获取序列掩码
+                        sequence_mask = targets.get('sequence_mask', None)
+                        if sequence_mask is not None:
+                            # 只计算有效位置的相似度
+                            valid_lengths = sequence_mask[valid_mask].sum(dim=1)
+                            for i, length in enumerate(valid_lengths):
+                                # 获取当前样本的预测和目标序列
+                                pred_seq = outputs['symbol_sequence'][valid_mask][i]
+                                true_seq = targets['symbol_sequence'][valid_mask][i]
+                                
+                                # 确保长度一致
+                                length = int(length.item())
+                                if pred_seq.size(-1) < length:
+                                    length = pred_seq.size(-1)
+                                if true_seq.size(-1) < length:
+                                    length = true_seq.size(-1)
+                                
+                                # 确保序列维度正确
+                                if len(pred_seq.shape) == 1:
+                                    pred_seq = pred_seq.unsqueeze(0)
+                                if len(true_seq.shape) == 1:
+                                    true_seq = true_seq.unsqueeze(0)
+                                
+                                # 计算相似度
+                                try:
+                                    cos_sim = F.cosine_similarity(
+                                        pred_seq[:, :length],
+                                        true_seq[:, :length],
+                                        dim=1
+                                    ).abs()
+                                    all_seq_sims.append(cos_sim.cpu())
+                                except RuntimeError as e:
+                                    logging.warning(f"计算相似度时出错: {str(e)}")
+                                    logging.warning(f"pred_seq shape: {pred_seq.shape}")
+                                    logging.warning(f"true_seq shape: {true_seq.shape}")
+                                    logging.warning(f"length: {length}")
+                                    continue
+                        else:
+                            # 如果没有掩码,使用较短序列的长度
+                            pred_seq = outputs['symbol_sequence'][valid_mask]
+                            true_seq = targets['symbol_sequence'][valid_mask]
+                            
+                            # 确保维度正确
+                            if len(pred_seq.shape) == 2:
+                                pred_seq = pred_seq.unsqueeze(1)
+                            if len(true_seq.shape) == 2:
+                                true_seq = true_seq.unsqueeze(1)
+                            
+                            # 使用最短的序列长度
+                            min_length = min(pred_seq.size(-1), true_seq.size(-1))
+                            
+                            try:
+                                cos_sim = F.cosine_similarity(
+                                    pred_seq[:, :min_length],
+                                    true_seq[:, :min_length],
+                                    dim=1
+                                ).abs()
+                                all_seq_sims.append(cos_sim.cpu())
+                            except RuntimeError as e:
+                                logging.warning(f"计算相似度时出错: {str(e)}")
+                                logging.warning(f"pred_seq shape: {pred_seq.shape}")
+                                logging.warning(f"true_seq shape: {true_seq.shape}")
+                                logging.warning(f"min_length: {min_length}")
+                                continue
+    
+    # 计算平均值
+    avg_loss = total_loss / num_batches
+    avg_scores = {k: v / num_batches for k, v in score_sums.items()}
+    
+    # 计算详细指标
+    all_mod_preds = torch.cat(all_mod_preds)
+    all_mod_targets = torch.cat(all_mod_targets)
+    mod_metrics = calculate_modulation_metrics(all_mod_preds, all_mod_targets)
+    
+    if all_width_errors:
+        all_width_errors = torch.cat(all_width_errors)
+        width_metrics = calculate_symbol_width_metrics(all_width_errors)
+    else:
+        width_metrics = {'mean_error': float('inf'), 'std_error': float('inf')}
+    
+    if all_seq_sims:
+        all_seq_sims = torch.cat(all_seq_sims)
+        seq_metrics = calculate_symbol_sequence_metrics(all_seq_sims)
+    else:
+        seq_metrics = {'mean_similarity': 0.0, 'std_similarity': 0.0}
+    
+    # 合并所有指标
+    metrics = {
+        'loss': avg_loss,
+        **avg_scores,
+        **mod_metrics,
+        **width_metrics,
+        **seq_metrics
+    }
+    
+    return metrics
+
+def custom_collate_fn(batch):
+    """自定义的批处理函数,处理不同长度的序列"""
+    # 取批次中的最大序列长度
+    max_seq_length = max(len(item['targets']['symbol_sequence']) for item in batch)
+    
+    # 准备批次数据
+    batch_data = []
+    batch_targets = {
+        'modulation_type': [],
+        'symbol_width': [],
+        'symbol_sequence': [],
+        'sequence_mask': []
+    }
+    
+    # 处理每个样本
+    for item in batch:
+        # 数据部分直接添加
+        batch_data.append(item['data'])
+        
+        # 目标部分
+        batch_targets['modulation_type'].append(item['targets']['modulation_type'])
+        batch_targets['symbol_width'].append(item['targets']['symbol_width'])
+        
+        # 处理序列数据
+        seq = item['targets']['symbol_sequence']
+        seq_len = len(seq)
+        
+        # 创建填后的序列
+        padded_seq = torch.zeros(max_seq_length, dtype=seq.dtype, device=seq.device)
+        padded_seq[:seq_len] = seq
+        batch_targets['symbol_sequence'].append(padded_seq)
+        
+        # 创建掩码
+        mask = torch.zeros(max_seq_length, dtype=torch.bool, device=seq.device)
+        mask[:seq_len] = True
+        batch_targets['sequence_mask'].append(mask)
+    
+    # 堆叠所有张量
+    batch_data = torch.stack(batch_data, dim=0)
+    batch_targets['modulation_type'] = torch.stack(batch_targets['modulation_type'], dim=0)
+    batch_targets['symbol_width'] = torch.stack(batch_targets['symbol_width'], dim=0)
+    batch_targets['symbol_sequence'] = torch.stack(batch_targets['symbol_sequence'], dim=0)
+    batch_targets['sequence_mask'] = torch.stack(batch_targets['sequence_mask'], dim=0)
+    
+    return {'data': batch_data, 'targets': batch_targets}
+
+def train(config: Config) -> None:
+    """训练主函数"""
+    # 设置日志
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = config.LOG_DIR / f"training_{timestamp}.log"
+    log_file = config.LOG_DIR / f'training_{timestamp}.log'
+    
+    # 创建日志格式
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # 文件处理器
+    file_handler = logging.FileHandler(str(log_file))
+    file_handler.setFormatter(formatter)
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
     
     # 配置根日志记录器
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    
-    # 清除现有的处理器
-    logger.handlers.clear()
-    
-    # 创建文件处理器
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s'
-    ))
     logger.addHandler(file_handler)
-    
-    # 创建控制台处理器
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s'
-    ))
     logger.addHandler(console_handler)
     
-    return logger
-
-class ModulationTrainer:
-    """调制分类器训练器"""
-    def __init__(self):
-        self.config = Config()
-        self.device = self.config.DEVICE
-        self.logger = setup_logging(self.config)
-        
-        # 初始化模型
-        self.model = ModulationClassifierEnsemble()
-        self.model.to(self.device)
-        
-        # 准备数据
-        self.train_loader = None
-        self.val_loader = None
-        
-        # 记录训练状态
-        self.current_epoch = 0
-        self.best_val_accuracy = 0.0
-        self.early_stopping = EarlyStopping(
-            patience=self.config.EARLY_STOPPING_PATIENCE,
-            min_delta=self.config.EARLY_STOPPING_MIN_DELTA,
-            mode=self.config.EARLY_STOPPING_MODE
+    # 记录训练开始
+    logging.info("="*50)
+    logging.info("训练开始")
+    logging.info("配置信息：")
+    logging.info(f"工作目录: {config.WORKING_DIR}")
+    logging.info(f"数据目录: {config.DATA_DIR}")
+    logging.info(f"输出目录: {config.OUTPUT_DIR}")
+    logging.info(f"设备: {config.DEVICE}")
+    logging.info(f"批次大小: {config.BATCH_SIZE}")
+    logging.info(f"学习率: {config.LEARNING_RATE}")
+    logging.info(f"优化器: {config.OPTIMIZER}")
+    logging.info(f"是否使用AMP: {config.AMP_ENABLED}")
+    logging.info(f"是否使用调度器: {config.USE_SCHEDULER}")
+    logging.info(f"任务权重: MT={config.MT_WEIGHT}, SW={config.SW_WEIGHT}, CQ={config.CQ_WEIGHT}")
+    logging.info("="*50)
+    
+    # 初始化wandb
+    if config.USE_WANDB:
+        wandb.init(
+            project=config.WANDB_PROJECT,
+            entity=config.WANDB_ENTITY,
+            name=config.WANDB_NAME or f"cascade_model_{timestamp}",
+            tags=config.WANDB_TAGS,
+            notes=config.WANDB_NOTES,
+            config=config.__dict__
         )
     
-    def prepare_data(self):
-        """准备数据加载器"""
-        # 创建数据集
-        dataset = ModulationDataset(
-            data_dir=self.config.DATA_DIR,
-            transform=ModulationDataset.get_transforms(self.config, mode='train'),
-            sequence_length=self.config.SEQUENCE_LENGTH
-        )
-        
-        # 划分训练集和验证集
-        train_size = int((1 - self.config.VALIDATION_RATIO) * len(dataset))
-        val_size = len(dataset) - train_size
-        train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-        
-        # 创建数据加载器
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.config.BATCH_SIZE,
-            shuffle=True,
-            num_workers=self.config.NUM_WORKERS,
-            pin_memory=self.config.PIN_MEMORY
-        )
-        
-        self.val_loader = DataLoader(
-            val_dataset,
-            batch_size=self.config.BATCH_SIZE,
-            shuffle=False,
-            num_workers=self.config.NUM_WORKERS,
-            pin_memory=self.config.PIN_MEMORY
-        )
-        
-        self.logger.info(f"数据集大小: {len(dataset)}")
-        self.logger.info(f"训练集大小: {len(train_dataset)}")
-        self.logger.info(f"验证集大小: {len(val_dataset)}")
-        self.logger.info(f"批次大小: {self.config.BATCH_SIZE}")
-        self.logger.info(f"序列长度: {self.config.SEQUENCE_LENGTH}")
+    # 创建数据加载器
+    train_dataset = MultiTaskSignalDataset(mode='train', config=config)
+    val_dataset = MultiTaskSignalDataset(mode='val', config=config)
     
-    def train_classifier(self, mod_name, train_loader, val_loader):
-        """训练单个分类器"""
-        classifier = self.model.classifiers[mod_name]
-        optimizer = self.config.get_optimizer(classifier.parameters())
-        scheduler = self.config.get_lr_scheduler(optimizer)
-        scaler = torch.cuda.amp.GradScaler() if self.config.AMP_ENABLED else None
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=config.MAX_WORKERS,
+        pin_memory=config.PIN_MEMORY,
+        collate_fn=custom_collate_fn  # 使用自定义的collate函数
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.MAX_WORKERS,
+        pin_memory=config.PIN_MEMORY,
+        collate_fn=custom_collate_fn  # 使用自定义的collate函数
+    )
+    
+    # 创建模型
+    model = MultiTaskModel(config)
+    model.to(config.DEVICE)
+    
+    # 获取损失函数和优化器
+    criterion = model.compute_loss  # 使用新的损失计算方法
+    optimizer = config.get_optimizer(model.parameters())
+    scheduler = config.get_scheduler(optimizer)
+    
+    # 创建早停对象
+    early_stopping = EarlyStopping(
+        patience=config.EARLY_STOPPING_PATIENCE,
+        min_delta=config.EARLY_STOPPING_MIN_DELTA,
+        mode='max',
+        monitor=config.EARLY_STOPPING_METRIC
+    )
+    
+    # 创建AMP scaler
+    scaler = torch.cuda.amp.GradScaler() if config.AMP_ENABLED else None
+    
+    # 训练循环
+    best_total_score = 0
+    for epoch in range(config.MAX_EPOCHS):
+        logging.info(f'\nEpoch {epoch+1}/{config.MAX_EPOCHS}')
         
-        best_val_acc = 0.0
-        early_stopping = EarlyStopping(
-            patience=self.config.EARLY_STOPPING_PATIENCE,
-            min_delta=self.config.EARLY_STOPPING_MIN_DELTA,
-            mode=self.config.EARLY_STOPPING_MODE
+        # 训练一个epoch
+        train_metrics = train_one_epoch(
+            model, train_loader, criterion, optimizer,
+            scheduler, config, epoch+1, scaler
         )
         
-        # 获取当前调制类型的索引
-        mod_idx = list(self.config.MODULATION_DICT.values()).index(mod_name)
+        # 验证
+        val_metrics = validate(model, val_loader, criterion, config)
         
-        for epoch in range(self.config.NUM_EPOCHS):
-            # 训练阶段
-            classifier.train()
-            train_loss = 0
-            correct = 0
-            total = 0
-            
-            for batch_idx, batch in enumerate(train_loader):
-                data = batch['data'].to(self.device)
-                targets = batch['targets']
-                target_labels = (targets['modulation_type'].to(self.device) == mod_idx).float()
-                
-                optimizer.zero_grad()
-                
-                if self.config.AMP_ENABLED:
-                    with torch.cuda.amp.autocast():
-                        loss = self.model.train_single_classifier(mod_name, data, {'modulation_type': target_labels})
-                        scaler.scale(loss).backward()
-                        if self.config.GRADIENT_CLIP_VAL > 0:
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(
-                                classifier.parameters(),
-                                self.config.GRADIENT_CLIP_VAL
-                            )
-                        scaler.step(optimizer)
-                        scaler.update()
-                else:
-                    loss = self.model.train_single_classifier(mod_name, data, {'modulation_type': target_labels})
-                    loss.backward()
-                    if self.config.GRADIENT_CLIP_VAL > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            classifier.parameters(),
-                            self.config.GRADIENT_CLIP_VAL
-                        )
-                    optimizer.step()
-                
-                train_loss += loss.item()
-                
-                # 计算准确率
-                outputs = classifier(data)
-                pred = (torch.sigmoid(outputs['logits']) > 0.5).float()
-                correct += (pred == target_labels).sum().item()
-                total += target_labels.size(0)
-                
-                if batch_idx % self.config.LOG_INTERVAL == 0:
-                    self.logger.info(
-                        f"{mod_name} Epoch: {epoch}, Batch: {batch_idx}, "
-                        f"Loss: {loss.item():.4f}, "
-                        f"Acc: {100.*correct/total:.2f}%"
-                    )
-            
-            avg_train_loss = train_loss / len(train_loader)
-            train_acc = correct / total
-            
-            # 验证阶段
-            classifier.eval()
-            val_loss = 0
-            correct = 0
-            total = 0
-            
-            with torch.no_grad():
-                for batch in val_loader:
-                    data = batch['data'].to(self.device)
-                    targets = batch['targets']
-                    target_labels = (targets['modulation_type'].to(self.device) == mod_idx).float()
-                    
-                    outputs = classifier(data)
-                    pred = (torch.sigmoid(outputs['logits']) > 0.5).float()
-                    
-                    loss = F.binary_cross_entropy_with_logits(outputs['logits'], target_labels)
-                    val_loss += loss.item()
-                    
-                    correct += (pred == target_labels).sum().item()
-                    total += target_labels.size(0)
-            
-            avg_val_loss = val_loss / len(val_loader)
-            val_acc = correct / total
-            
-            # 更新学习率
-            if scheduler is not None:
-                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step(avg_val_loss)
-                else:
-                    scheduler.step()
-            
-            # 记录到wandb
-            if self.config.USE_WANDB:
-                wandb.log({
-                    f"{mod_name}/train_loss": avg_train_loss,
-                    f"{mod_name}/train_acc": train_acc,
-                    f"{mod_name}/val_loss": avg_val_loss,
-                    f"{mod_name}/val_acc": val_acc,
-                    f"{mod_name}/learning_rate": optimizer.param_groups[0]['lr']
-                })
-            
-            # 保存最佳模型
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                save_path = self.config.CHECKPOINT_DIR / mod_name / "best_model.pth"
-                classifier.save_model(str(save_path))
-                
-                # 如果达到95%准确率，提前结束训练
-                if val_acc >= 0.95:
-                    self.logger.info(f"{mod_name} 达到目标准确率95%，提前结束训练")
-                    break
-            
-            # 早停检查
-            if early_stopping(val_acc):
-                self.logger.info(f"{mod_name} 触发早停，在第{epoch}轮")
-                break
+        # 记录训练信息
+        logging.info(
+            f"训练损失: {train_metrics['loss']:.4f}, "
+            f"训练总���: {train_metrics['total_score']:.2f}\n"
+            f"验证损失: {val_metrics['loss']:.4f}, "
+            f"验证总分: {val_metrics['total_score']:.2f}\n"
+            f"验证分项分数: MT={val_metrics['mt_score']:.1f}, "
+            f"SW={val_metrics['sw_score']:.1f}, "
+            f"CQ={val_metrics['cq_score']:.1f}\n"
+            f"学习率: {optimizer.param_groups[0]['lr']:.6f}"
+        )
         
-        # 加载最佳模型
-        best_model_path = self.config.CHECKPOINT_DIR / mod_name / "best_model.pth"
-        classifier.load_model(str(best_model_path))
-        
-        return best_val_acc
-    
-    def predict_ensemble(self, data):
-        """集成预测函数"""
-        # 收集所有分类器的预测结果
-        predictions = {}
-        confidences = {}
-        raw_outputs = {}
-        
-        # 获取每个分类器的原始输出和置信度
-        for mod_name, classifier in self.model.classifiers.items():
-            classifier.eval()
-            with torch.no_grad():
-                outputs = classifier(data)
-                logits = outputs['modulation_type'].squeeze()
-                
-                # 使用温度缩放进行置信度校准
-                temperature = 2.0  # 可调的温度参数
-                scaled_logits = logits / temperature
-                probs = torch.sigmoid(scaled_logits)
-                
-                raw_outputs[mod_name] = logits.cpu()
-                confidences[mod_name] = probs.cpu()
-                predictions[mod_name] = (probs > self.config.CONFIDENCE_THRESHOLD).float().cpu()
-        
-        # 计算每个类别的综合得分
-        scores = {}
-        for mod_name in self.config.MODULATION_DICT.values():
-            # 当前分类器的置信度得分
-            base_confidence = confidences[mod_name].mean().item()
-            
-            # 计算与其他分类器的一致性得分
-            consistency_scores = []
-            for other_name, other_conf in confidences.items():
-                if other_name != mod_name:
-                    # 计算当前分类器和其他分类器预测的一致性
-                    agreement = 1 - abs(confidences[mod_name] - (1 - other_conf)).mean().item()
-                    consistency_scores.append(agreement)
-            
-            # 计算一致性得分
-            consistency_score = sum(consistency_scores) / len(consistency_scores) if consistency_scores else 0
-            
-            # 综合得分：结合置信度和一致性
-            scores[mod_name] = base_confidence * (0.7 + 0.3 * consistency_score)
-        
-        # 使用加权投票和置信度阈值的混合策略
-        if self.config.ENSEMBLE_MODE == 'hybrid':
-            # 初始化投票计数
-            votes = {mod_name: 0.0 for mod_name in self.config.MODULATION_DICT.values()}
-            
-            # 根据置信度进加权投票
-            for mod_name, pred in predictions.items():
-                confidence = confidences[mod_name].mean().item()
-                if confidence > self.config.MIN_VOTE_CONFIDENCE:
-                    # 投票权重 = 基础权重 * 置信度
-                    votes[mod_name] += confidence
-            
-            # 结合投票结果和综合得分
-            final_scores = {}
-            for mod_name in self.config.MODULATION_DICT.values():
-                vote_weight = votes[mod_name] / (sum(votes.values()) + 1e-6)
-                score_weight = scores[mod_name] / (sum(scores.values()) + 1e-6)
-                final_scores[mod_name] = 0.4 * vote_weight + 0.6 * score_weight
-            
-            # 选择最终预测
-            final_prediction = max(final_scores.items(), key=lambda x: x[1])[0]
-            confidence = final_scores[final_prediction]
-        else:
-            # 使用原有的最大置信度策略
-            final_prediction = max(scores.items(), key=lambda x: x[1])[0]
-            confidence = scores[final_prediction]
-        
-        return final_prediction, confidence
-    
-    def evaluate_ensemble(self, data_loader):
-        """评估集成模型的性能"""
-        total = 0
-        correct = 0
-        confusion_mat = np.zeros((len(self.config.MODULATION_DICT), len(self.config.MODULATION_DICT)))
-        
-        # 用于计算每个类别的性能
-        class_metrics = {mod_name: {
-            'correct': 0,
-            'total': 0,
-            'confidences': [],
-            'consistency_scores': [],
-            'false_positives': 0,
-            'false_negatives': 0
-        } for mod_name in self.config.MODULATION_DICT.values()}
-        
-        for batch in tqdm(data_loader, desc="Evaluating ensemble"):
-            data = batch['data'].to(self.device)
-            true_labels = batch['modulation_type'].cpu()
-            
-            for i in range(len(data)):
-                # 获取预测结果和详细指标
-                pred_mod, confidence, details = self.predict_ensemble_with_details(data[i:i+1])
-                true_mod = self.config.MODULATION_DICT[true_labels[i].item()]
-                
-                # 更新基本统计
-                total += 1
-                if pred_mod == true_mod:
-                    correct += 1
-                    class_metrics[true_mod]['correct'] += 1
-                else:
-                    # 记录错误分类
-                    class_metrics[pred_mod]['false_positives'] += 1
-                    class_metrics[true_mod]['false_negatives'] += 1
-                
-                # 更新类别统计
-                class_metrics[true_mod]['total'] += 1
-                class_metrics[pred_mod]['confidences'].append(confidence)
-                if 'consistency_score' in details:
-                    class_metrics[pred_mod]['consistency_scores'].append(details['consistency_score'])
-                
-                # 更新混淆矩阵
-                pred_idx = list(self.config.MODULATION_DICT.values()).index(pred_mod)
-                true_idx = list(self.config.MODULATION_DICT.values()).index(true_mod)
-                confusion_mat[true_idx][pred_idx] += 1
-        
-        # 计算总体准确率
-        accuracy = correct / total
-        
-        # 计算每个类别的详细指标
-        class_performance = {}
-        for mod_name, metrics in class_metrics.items():
-            if metrics['total'] > 0:
-                precision = metrics['correct'] / (metrics['correct'] + metrics['false_positives']) if (metrics['correct'] + metrics['false_positives']) > 0 else 0
-                recall = metrics['correct'] / metrics['total']
-                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-                
-                class_performance[mod_name] = {
-                    'accuracy': metrics['correct'] / metrics['total'],
-                    'precision': precision,
-                    'recall': recall,
-                    'f1_score': f1,
-                    'avg_confidence': np.mean(metrics['confidences']) if metrics['confidences'] else 0,
-                    'avg_consistency': np.mean(metrics['consistency_scores']) if metrics['consistency_scores'] else 0,
-                    'sample_count': metrics['total']
-                }
-        
-        # 记录评估结果
-        self.logger.info("\n=== 集成模型评估结果 ===")
-        self.logger.info(f"总体准确率: {accuracy:.4f}")
-        self.logger.info("\n各类别性能:")
-        for mod_name, perf in class_performance.items():
-            self.logger.info(
-                f"{mod_name}: "
-                f"准确率={perf['accuracy']:.4f}, "
-                f"精确率={perf['precision']:.4f}, "
-                f"召回率={perf['recall']:.4f}, "
-                f"F1分数={perf['f1_score']:.4f}, "
-                f"平均置信度={perf['avg_confidence']:.4f}, "
-                f"平均一致性={perf['avg_consistency']:.4f}, "
-                f"样本数={perf['sample_count']}"
-            )
-        
-        if self.config.USE_WANDB:
+        # 记录到wandb
+        if config.USE_WANDB:
             wandb.log({
-                "ensemble_accuracy": accuracy,
-                "class_performance": class_performance,
-                "confusion_matrix": wandb.plot.confusion_matrix(
-                    probs=None,
-                    y_true=np.argmax(confusion_mat, axis=1),
-                    preds=np.argmax(confusion_mat, axis=0),
-                    class_names=list(self.config.MODULATION_DICT.values())
-                )
+                'epoch': epoch + 1,
+                'train_loss': train_metrics['loss'],
+                'train_mt_score': train_metrics['mt_score'],
+                'train_sw_score': train_metrics['sw_score'],
+                'train_cq_score': train_metrics['cq_score'],
+                'train_total_score': train_metrics['total_score'],
+                'val_loss': val_metrics['loss'],
+                'val_mt_score': val_metrics['mt_score'],
+                'val_sw_score': val_metrics['sw_score'],
+                'val_cq_score': val_metrics['cq_score'],
+                'val_total_score': val_metrics['total_score'],
+                'learning_rate': optimizer.param_groups[0]['lr'],
+                **{f'val_{k}': v for k, v in val_metrics.items() 
+                   if k not in ['loss', 'mt_score', 'sw_score', 'cq_score', 'total_score']}
             })
         
-        return accuracy, class_performance, confusion_mat
+        # 保存最佳模型
+        if val_metrics['total_score'] > best_total_score:
+            best_total_score = val_metrics['total_score']
+            model_path = config.OUTPUT_DIR / f'best_model_{timestamp}.pth'
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'best_total_score': best_total_score,
+                'config': config.__dict__,
+                'val_metrics': val_metrics
+            }, model_path)
+            logging.info(f"保存最佳模型 - 验证总分: {best_total_score:.2f}")
+        
+        # 更新学习率
+        if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_metrics[config.EARLY_STOPPING_METRIC])
+            else:
+                scheduler.step()
+        
+        # 早停检查
+        if early_stopping(val_metrics):
+            logging.info(f"触发早停，共训练{epoch + 1}个epoch")
+            break
     
-    def predict_ensemble_with_details(self, data):
-        """带详细信息的集成预测函数"""
-        pred_mod, confidence = self.predict_ensemble(data)
-        
-        # 收集预测详情
-        details = {
-            'raw_confidences': {},
-            'consistency_scores': {},
-            'vote_weights': {},
-            'final_scores': {}
-        }
-        
-        # 获取每个分类器的预测结果
-        predictions = {}
-        confidences = {}
-        for mod_name, classifier in self.model.classifiers.items():
-            classifier.eval()
-            with torch.no_grad():
-                outputs = classifier(data)
-                logits = outputs['modulation_type'].squeeze()
-                
-                if self.config.USE_TEMPERATURE_SCALING:
-                    scaled_logits = logits / self.config.TEMPERATURE
-                    probs = torch.sigmoid(scaled_logits)
-                else:
-                    probs = torch.sigmoid(logits)
-                
-                predictions[mod_name] = (probs > self.config.CONFIDENCE_THRESHOLD).float().cpu()
-                confidences[mod_name] = probs.cpu()
-                details['raw_confidences'][mod_name] = probs.mean().item()
-        
-        # 计算一致性得分
-        if self.config.USE_CONSISTENCY_SCORE:
-            for mod_name in self.config.MODULATION_DICT.values():
-                consistency_scores = []
-                for other_name, other_conf in confidences.items():
-                    if other_name != mod_name:
-                        agreement = 1 - abs(confidences[mod_name] - (1 - other_conf)).mean().item()
-                        consistency_scores.append(agreement)
-                
-                avg_consistency = sum(consistency_scores) / len(consistency_scores) if consistency_scores else 0
-                details['consistency_scores'][mod_name] = avg_consistency
-        
-        # 计算投票权重
-        votes = {mod_name: 0.0 for mod_name in self.config.MODULATION_DICT.values()}
-        for mod_name, pred in predictions.items():
-            confidence = confidences[mod_name].mean().item()
-            if confidence > self.config.MIN_VOTE_CONFIDENCE:
-                votes[mod_name] += confidence
-        
-        total_votes = sum(votes.values()) + 1e-6
-        for mod_name in votes:
-            details['vote_weights'][mod_name] = votes[mod_name] / total_votes
-        
-        # 记录最终得分
-        details['final_scores'] = {
-            mod_name: confidence for mod_name, confidence in zip(
-                self.config.MODULATION_DICT.values(),
-                confidences.values()
-            )
-        }
-        
-        return pred_mod, confidence, details
+    # 保存最终模型
+    final_model_path = config.OUTPUT_DIR / f'final_model_{timestamp}.pth'
+    torch.save({
+        'epoch': epoch + 1,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'best_total_score': best_total_score,
+        'config': config.__dict__,
+        'val_metrics': val_metrics
+    }, final_model_path)
     
-    def train(self):
-        """训练模型"""
-        self.prepare_data()
-        
-        # 初始化wandb（如果启用）
-        if self.config.USE_WANDB:
-            try:
-                wandb.init(
-                    project=self.config.WANDB_PROJECT,
-                    entity=self.config.WANDB_ENTITY,
-                    config=self.config.__dict__,
-                    name=f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                )
-            except Exception as e:
-                self.logger.warning(f"wandb初始化失败: {str(e)}")
-                self.config.USE_WANDB = False
-        
-        # 训练每个分类器
-        for mod_name in self.config.MODULATION_DICT.values():
-            self.logger.info(f"\n训练分类器: {mod_name}")
-            best_acc = self.train_classifier(mod_name, self.train_loader, self.val_loader)
-            self.logger.info(f"{mod_name} 最佳验证准确率: {best_acc:.4f}")
-        
-        # 校准温度参数
-        if self.config.USE_TEMPERATURE_SCALING:
-            self.logger.info("\n开始校准温度参数...")
-            self.model.calibrate_temperature(self.val_loader)
-        
-        # 评估集成模型
-        self.logger.info("\n开始评估集成模型...")
-        accuracy, class_performance, confusion_mat = self.evaluate_ensemble(self.val_loader)
-        
-        # 保存最终模型
-        save_path = self.config.CHECKPOINT_DIR / "final_model.pth"
-        self.model.save_classifiers(save_path.parent)
-        
-        # 关闭wandb
-        if self.config.USE_WANDB:
-            wandb.finish()
-        
-        return accuracy, class_performance
+    logging.info("训练完成")
+    logging.info(f"最佳验证总分: {best_total_score:.2f}")
+    logging.info("="*50)
+    
+    if config.USE_WANDB:
+        wandb.finish()
 
-def main():
-    """主函数"""
-    try:
-        trainer = ModulationTrainer()
-        accuracy, class_performance = trainer.train()
-        
-        print("\n=== 训练完成 ===")
-        print(f"总体准确率: {accuracy:.4f}")
-        print("\n各类别性能:")
-        for mod_name, perf in class_performance.items():
-            print(
-                f"{mod_name}: "
-                f"准确率={perf['accuracy']:.4f}, "
-                f"精确率={perf['precision']:.4f}, "
-                f"召回率={perf['recall']:.4f}, "
-                f"F1分数={perf['f1_score']:.4f}"
-            )
-    
-    except Exception as e:
-        print(f"\n训练发生错误: {str(e)}")
-        traceback.print_exc()
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main() 
+if __name__ == '__main__':
+    config = Config()
+    train(config) 

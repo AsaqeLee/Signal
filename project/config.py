@@ -1,92 +1,94 @@
-import torch
 import os
-import math
-import json
-from datetime import datetime
+import torch
+import torch.optim as optim
 from pathlib import Path
-import torch.distributed as dist
-import time
-import shutil
+import json
+import logging
+from typing import Dict, Any, List, Union
 
 class Config:
     """配置类"""
     
-    # 移除资源限制
-    MAX_WORKERS = os.cpu_count()  # 使用所有CPU核心
-    MAX_MEMORY = None  # 不限制内存使用
+    # 资源参数
+    MAX_WORKERS: int = 4
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    PIN_MEMORY = True
     
     # 数据参数
-    SEQUENCE_LENGTH = 2048  # 统一的序列长度
-    SAMPLE_RATE = 20e6  # 20MHz，即每微秒20个采样点
-    SAMPLES_PER_CLASS = 16200  # 每个调制类型的样本数
-    FILTER_LOW_FREQ = 0.002  # 归一化后的低频截止频率 (20kHz/10MHz)
-    FILTER_HIGH_FREQ = 0.98  # 归一化后的高频截止频率 (略小于奈奎斯特频率)
-    FILTER_ORDER = 8  # 滤波器阶数
-    
-    # 信号质量参数
-    USE_SNR_FILTER = False  # 是否使用SNR过滤，设为False表示接受所有信噪比
-    SNR_UNKNOWN = -999  # 用于表示未知或不需要考虑SNR的情况
+    SAMPLING_RATE: float = 20e6  # 20MHz采样率
+    SAMPLES_PER_CLASS: int = 16200
+    SEQUENCE_LENGTH: int = 1024
+    MIN_SYMBOL_WIDTH: float = 1e-6  # 最小码元宽度(1us)
+    MAX_SYMBOL_WIDTH: float = 1e-4  # 最大码元宽度(100us)
     
     # 模型参数
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    BATCH_SIZE = 128  # 减小批次大小以适应内存
-    FEATURE_DIM = 256  # 特征维度
-    DROPOUT_RATE = 0.3  # Dropout比率
-    
-    # 集成学习参数
-    ENSEMBLE_MODE = 'hybrid'  # 'max_confidence', 'voting', 或 'hybrid'
-    CONFIDENCE_THRESHOLD = 0.8  # 置信度阈值
-    MIN_VOTE_CONFIDENCE = 0.6  # 最小投票置信度
-    TEMPERATURE = 2.0  # 温度缩放参数
-    CONSISTENCY_WEIGHT = 0.3  # 一致性得分权重
-    VOTE_WEIGHT = 0.4  # 投票权重
-    CONFIDENCE_WEIGHT = 0.6  # 置信度权重
-    USE_TEMPERATURE_SCALING = True  # 是否使用温度缩放
-    USE_CONSISTENCY_SCORE = True  # 是否使用一致性得分
-    MIN_CONSISTENCY_THRESHOLD = 0.5  # 最小一致性阈值
+    BACKBONE_CHANNELS: List[int] = [64, 128, 256, 512, 1024]  # 主干网络通道数
+    FEATURE_DIM: int = 1024
+    DROPOUT_RATE: float = 0.2
+    USE_TEMPERATURE_SCALING: bool = True
+    TEMPERATURE: float = 1.0
+    CONFIDENCE_THRESHOLD: float = 0.5
     
     # 训练参数
-    NUM_EPOCHS = 50  # 每个分类器的训练轮数
-    LEARNING_RATE = 0.001  # 初始学习率
-    MIN_LEARNING_RATE = 1e-6  # 最小学习率
-    WEIGHT_DECAY = 1e-5  # 权重衰减
-    GRADIENT_CLIP_VAL = 1.0  # 梯度裁剪阈值
-    VALIDATION_RATIO = 0.2  # 验证集比例
+    BATCH_SIZE: int = 128
+    GRADIENT_ACCUMULATION_STEPS: int = 2
+    MAX_EPOCHS: int = 300
     
-    # 早停参数
-    EARLY_STOPPING_PATIENCE = 10  # 早停耐心值
-    EARLY_STOPPING_MIN_DELTA = 0.001  # 最小改善阈值
-    EARLY_STOPPING_MODE = 'max'  # 监控模式: 'min' 用于损失, 'max' 用于准确率
+    # 任务权重
+    MT_WEIGHT: float = 0.5
+    SW_WEIGHT: float = 0.3
+    CQ_WEIGHT: float = 0.2
     
-    # 数据增强参数
-    USE_MIXUP = True  # 是否使用Mixup
-    MIXUP_ALPHA = 0.2  # Mixup参数
-    USE_CUTMIX = True  # 是否使用CutMix
-    CUTMIX_ALPHA = 1.0  # CutMix参数
+    # 评分阈值
+    SW_THRESHOLDS: Dict[str, float] = {
+        'perfect': 0.05,  # ERk <= 0.05 得满分
+        'acceptable': 0.2  # 0.05 < ERk <= 0.2 按比例得分
+    }
+    
+    CQ_THRESHOLDS: Dict[str, float] = {
+        'perfect': 0.95,  # CSi >= 0.95 得满分
+        'acceptable': 0.7  # 0.7 <= CSi < 0.95 按比例得分
+    }
     
     # 优化器参数
-    OPTIMIZER = 'adamw'  # 使用AdamW优化器
-    MOMENTUM = 0.9  # SGD动量（如果使用SGD）
-    BETA1 = 0.9  # Adam/AdamW的beta1参数
-    BETA2 = 0.999  # Adam/AdamW的beta2参数
-    EPS = 1e-8  # Adam/AdamW的epsilon参数
+    OPTIMIZER: str = 'adamw'
+    LEARNING_RATE: float = 5e-4
+    MIN_LEARNING_RATE: float = 1e-6
+    WEIGHT_DECAY: float = 0.01
+    MOMENTUM = 0.9
+    BETA1 = 0.9
+    BETA2 = 0.999
+    EPS = 1e-8
     
     # 学习率调度参数
-    LR_SCHEDULER = 'cosine'  # 使用余弦退火调度
-    LR_DECAY_RATE = 0.1  # 学习率衰减率
-    LR_STEP_SIZE = 30  # 学习率衰减步长
-    WARMUP_EPOCHS = 5  # 预热轮数
-    WARMUP_METHOD = 'linear'  # 预热方式
+    LR_SCHEDULER = 'one_cycle'
+    WARMUP_PCT = 0.1
+    DIV_FACTOR = 10.0
+    FINAL_DIV_FACTOR = 1e3
     
-    # 日志和检查点参数
-    LOG_INTERVAL = 10  # 每10个batch打印一次日志
-    SAVE_INTERVAL = 100  # 每100个batch保存一次检查点
-    USE_WANDB = True  # 是否使用wandb
-    WANDB_PROJECT = "modulation-classification"  # wandb项目名称
-    WANDB_ENTITY = None  # wandb实体名称
+    # 正则化参数
+    LABEL_SMOOTHING: float = 0.1
+    GRADIENT_CLIP_VAL: float = 0.5
+    L2_REG_WEIGHT: float = 0.005
+    
+    # 数据增强参数
+    USE_MIXUP = True
+    MIXUP_ALPHA = 0.2
+    USE_CUTMIX = False
+    CUTMIX_ALPHA = 1.0
+    USE_SPECAUGMENT = True
+    USE_RANDOM_ERASING = False
+    
+    # 早停参数
+    EARLY_STOPPING_PATIENCE: int = 30
+    EARLY_STOPPING_MIN_DELTA: float = 1e-4
+    EARLY_STOPPING_METRIC: str = 'mt_score'
+    
+    # GPU优化参数
+    AMP_ENABLED: bool = True
     
     # 调制类型映射
-    MODULATION_DICT = {
+    MODULATION_DICT: Dict[int, str] = {
         1: 'BPSK',
         2: 'QPSK',
         3: '8PSK',
@@ -99,253 +101,209 @@ class Config:
         10: '32APSK'
     }
     
-    # 模型相关参数
-    NUM_CLASSES = len(MODULATION_DICT)  # 移到MODULATION_DICT定义之后
-    
-    # 评分参数
-    MT_WEIGHT = 0.4  # 调制类型权重
-    SW_WEIGHT = 0.6  # 码元宽度权重
-    
-    # 训练参数 - 优化训练过程
-    MAX_EPOCHS = 100  # 最大训练轮数
-    TARGET_ACCURACY = 0.95  # 目标准确率
-    
-    # 集成学习参数
-    CONFIDENCE_THRESHOLD = 0.8  # 置信度阈值
-    MIN_VOTE_CONFIDENCE = 0.6  # 最小投票置信度
-    TEMPERATURE = 2.0  # 温度缩放参数
-    CONSISTENCY_WEIGHT = 0.3  # 一致性得分权重
-    VOTE_WEIGHT = 0.4  # 投票权重
-    CONFIDENCE_WEIGHT = 0.6  # 置信度权重
-    USE_TEMPERATURE_SCALING = True  # 是否使用温度缩放
-    USE_CONSISTENCY_SCORE = True  # 是否使用一致性得分
-    MIN_CONSISTENCY_THRESHOLD = 0.5  # 最小一致性阈值
-    
-    # 优化器参数
-    OPTIMIZER = 'adamw'
-    WEIGHT_DECAY = 1e-5
-    MOMENTUM = 0.9
-    BETA1 = 0.9
-    BETA2 = 0.999
-    EPS = 1e-8
-    
-    # 学习率调度参数
-    LR_SCHEDULER = 'cosine'
-    LR_DECAY_RATE = 0.1
-    LR_STEP_SIZE = 30
-    WARMUP_EPOCHS = 5
-    WARMUP_METHOD = 'linear'
-    
-    # 数据增强参数
-    USE_MIXUP = True
-    MIXUP_ALPHA = 0.2
-    USE_CUTMIX = True
-    CUTMIX_ALPHA = 1.0
-    
-    # GPU优化参数
-    AMP_ENABLED = True  # 启用自动混合精度
-    PIN_MEMORY = True  # 启用内存固定
-    GRADIENT_CLIP_VAL = 1.0
-    
-    # 数据加载优化
-    PREFETCH_FACTOR = 4  # 增大预加载因子
-    PERSISTENT_WORKERS = True  # 保持工作进程存活
-    NUM_WORKERS = os.cpu_count() * 2  # 使用更多的数据加载线程
+    # 调制类型参数
+    MODULATION_PARAMS: Dict[str, Dict[str, Any]] = {
+        'BPSK': {'constellation_points': 2, 'bits_per_symbol': 1},
+        'QPSK': {'constellation_points': 4, 'bits_per_symbol': 2},
+        '8PSK': {'constellation_points': 8, 'bits_per_symbol': 3},
+        'MSK': {'constellation_points': 2, 'bits_per_symbol': 1},
+        '8QAM': {'constellation_points': 8, 'bits_per_symbol': 3},
+        '16QAM': {'constellation_points': 16, 'bits_per_symbol': 4},
+        '32QAM': {'constellation_points': 32, 'bits_per_symbol': 5},
+        '8APSK': {'constellation_points': 8, 'bits_per_symbol': 3},
+        '16APSK': {'constellation_points': 16, 'bits_per_symbol': 4},
+        '32APSK': {'constellation_points': 32, 'bits_per_symbol': 5}
+    }
     
     # 日志和检查点参数
-    LOG_INTERVAL = 10  # 每10个batch打印一次日志
-    SAVE_INTERVAL = 100  # 每100个batch保存一次检查点
+    LOG_INTERVAL: int = 10
+    SAVE_INTERVAL: int = 100
     
-    # 实验追踪参数
-    USE_WANDB = True  # 使用wandb进行实验追踪
-    WANDB_PROJECT = "modulation-classification"  # wandb项目名称
-    WANDB_ENTITY = None  # wandb实体名称
+    # wandb配置
+    USE_WANDB: bool = True
+    WANDB_PROJECT: str = "signal-cascade-model"
+    WANDB_ENTITY: Union[str, None] = None
+    WANDB_NAME: Union[str, None] = None
+    WANDB_TAGS: List[str] = ['cascade-model', 'signal-processing']
+    WANDB_NOTES: str = "级联信号处理模型训练"
     
-    def __init__(self):
-        # 基础路径配置
-        self.PROJECT_ROOT = Path(__file__).parent.parent
-        self.DATA_DIR = self.PROJECT_ROOT / "train_data_true"
-        self.CHECKPOINT_DIR = self.PROJECT_ROOT / "checkpoints"
-        self.LOG_DIR = self.PROJECT_ROOT / "logs"
+    # 训练技巧
+    USE_SCHEDULER: bool = True
+    
+    def __init__(self) -> None:
+        """初始化配置"""
+        # 设置日志
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        
+        # 设置路径
+        self.WORKING_DIR = Path(os.getcwd()).resolve()
+        self.OUTPUT_DIR = self.WORKING_DIR / 'output'
+        self.CHECKPOINT_DIR = self.OUTPUT_DIR / 'checkpoints'
+        self.LOG_DIR = self.OUTPUT_DIR / 'logs'
+        self.DATA_DIR = self.WORKING_DIR / 'train_data_true'
+        
+        # 创建必要的目录
+        self.OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+        self.CHECKPOINT_DIR.mkdir(exist_ok=True)
+        self.LOG_DIR.mkdir(exist_ok=True)
         
         # 检查数据目录
         if not self.DATA_DIR.exists():
             raise RuntimeError(f"数据目录不存在: {self.DATA_DIR}")
+        
+        # 检查CUDA可用性
+        self.CUDA_AVAILABLE = torch.cuda.is_available()
+        if not self.CUDA_AVAILABLE:
+            logging.warning("CUDA不可用,切换到CPU模式")
+            self.DEVICE = torch.device('cpu')
+            self.AMP_ENABLED = False
+        else:
+            self.DEVICE = torch.device('cuda')
             
-        # 检查数据目录下的调制类型子目录
-        for mod_name in self.MODULATION_DICT.values():
-            mod_dir = self.DATA_DIR / mod_name
-            if not mod_dir.exists():
-                raise RuntimeError(f"调制类型目录不存在: {mod_dir}")
-        
-        # 创建必要的目录
-        self.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        self.LOG_DIR.mkdir(parents=True, exist_ok=True)
-        
-        # 日志文件配置
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.LOG_FILE = self.LOG_DIR / f"training_{timestamp}.log"
-        
-        # 检查点文件配置
-        self.LAST_CHECKPOINT = self.CHECKPOINT_DIR / "last_checkpoint.pth"
-        self.BEST_CHECKPOINT = self.CHECKPOINT_DIR / "best_checkpoint.pth"
-        self.TRAINING_STATE = self.CHECKPOINT_DIR / "training_state.json"
-        
-        # 训练状态
-        self.training_state = {
-            'current_epoch': 0,
-            'best_val_score': float('-inf'),
-            'early_stop_counter': 0
-        }
-        
-        # 清理旧的检查点
-        self._backup_and_clean_checkpoints()
-        
-        # 设备配置
-        self.DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # 为每个调制类型创建检查点目录
-        for mod_name in self.MODULATION_DICT.values():
-            mod_checkpoint_dir = self.CHECKPOINT_DIR / mod_name
-            mod_checkpoint_dir.mkdir(exist_ok=True, parents=True)
+        # 打印置信息
+        logging.info("配置初始化完成:")
+        logging.info(f"工作目录: {self.WORKING_DIR}")
+        logging.info(f"数据目录: {self.DATA_DIR}")
+        logging.info(f"输出目录: {self.OUTPUT_DIR}")
+        logging.info(f"设备: {self.DEVICE}")
+        logging.info(f"批次大小: {self.BATCH_SIZE}")
+        logging.info(f"学习率: {self.LEARNING_RATE}")
+        logging.info(f"优化器: {self.OPTIMIZER}")
+        logging.info(f"是否使用AMP: {self.AMP_ENABLED}")
+        logging.info(f"是否使用调度器: {self.USE_SCHEDULER}")
+        logging.info(f"任务权重: MT={self.MT_WEIGHT}, SW={self.SW_WEIGHT}, CQ={self.CQ_WEIGHT}")
     
-    def _backup_and_clean_checkpoints(self):
-        """备份并清理检查点文件"""
-        # 只在开始新的训练时清理
-        if self.training_state['current_epoch'] == 0:
-            # 清理主检查点目录
-            for checkpoint in self.CHECKPOINT_DIR.glob("*.pth"):
-                checkpoint.unlink()
-            if self.TRAINING_STATE.exists():
-                self.TRAINING_STATE.unlink()
-                
-            # 清理每个调制类型的检查点目录
-            for mod_name in self.MODULATION_DICT.values():
-                mod_dir = self.CHECKPOINT_DIR / mod_name
-                if mod_dir.exists():
-                    for checkpoint in mod_dir.glob("*.pth"):
-                        checkpoint.unlink()
-                    for state_file in mod_dir.glob("*.json"):
-                        state_file.unlink()
-            
-            print("已清理所有旧的检查点文件")
-    
-    def get_optimizer(self, model_parameters):
+    def get_optimizer(self, parameters) -> optim.Optimizer:
         """获取优化器"""
-        if self.OPTIMIZER == 'adam':
-            return torch.optim.Adam(
-                model_parameters,
+        if self.OPTIMIZER.lower() == 'adamw':
+            return optim.AdamW(
+                parameters,
                 lr=self.LEARNING_RATE,
+                weight_decay=self.WEIGHT_DECAY,
                 betas=(self.BETA1, self.BETA2),
-                eps=self.EPS,
-                weight_decay=self.WEIGHT_DECAY
+                eps=self.EPS
             )
-        elif self.OPTIMIZER == 'adamw':
-            return torch.optim.AdamW(
-                model_parameters,
+        elif self.OPTIMIZER.lower() == 'adam':
+            return optim.Adam(
+                parameters,
                 lr=self.LEARNING_RATE,
+                weight_decay=self.WEIGHT_DECAY,
                 betas=(self.BETA1, self.BETA2),
-                eps=self.EPS,
-                weight_decay=self.WEIGHT_DECAY
+                eps=self.EPS
             )
-        elif self.OPTIMIZER == 'sgd':
-            return torch.optim.SGD(
-                model_parameters,
+        elif self.OPTIMIZER.lower() == 'sgd':
+            return optim.SGD(
+                parameters,
                 lr=self.LEARNING_RATE,
                 momentum=self.MOMENTUM,
-                weight_decay=self.WEIGHT_DECAY,
-                nesterov=True
+                weight_decay=self.WEIGHT_DECAY
             )
         else:
-            raise ValueError(f"不支持的优化器类型: {self.OPTIMIZER}")
+            raise ValueError(f"不支持的优化器: {self.OPTIMIZER}")
     
-    def get_lr_scheduler(self, optimizer):
+    def get_scheduler(self, optimizer) -> optim.lr_scheduler._LRScheduler:
         """获取学习率调度器"""
-        if self.LR_SCHEDULER == 'cosine':
-            return torch.optim.lr_scheduler.CosineAnnealingLR(
+        if not self.USE_SCHEDULER:
+            return None
+            
+        # 计算每个epoch的步数
+        steps_per_epoch = self.SAMPLES_PER_CLASS * len(self.MODULATION_DICT) // self.BATCH_SIZE
+        
+        if self.LR_SCHEDULER.lower() == 'one_cycle':
+            return optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=self.LEARNING_RATE,
+                epochs=self.MAX_EPOCHS,
+                steps_per_epoch=steps_per_epoch,
+                pct_start=self.WARMUP_PCT,
+                div_factor=self.DIV_FACTOR,
+                final_div_factor=self.FINAL_DIV_FACTOR,
+                anneal_strategy='cos'
+            )
+        elif self.LR_SCHEDULER.lower() == 'cosine':
+            return optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
                 T_max=self.MAX_EPOCHS,
                 eta_min=self.MIN_LEARNING_RATE
             )
-        elif self.LR_SCHEDULER == 'step':
-            return torch.optim.lr_scheduler.StepLR(
+        elif self.LR_SCHEDULER.lower() == 'plateau':
+            return optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
-                step_size=self.LR_STEP_SIZE,
-                gamma=self.LR_DECAY_RATE
-            )
-        elif self.LR_SCHEDULER == 'plateau':
-            return torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=self.LR_DECAY_RATE,
-                patience=5,
-                verbose=True
-            )
-        elif self.LR_SCHEDULER == 'onecycle':
-            return torch.optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=self.MAX_LR,
-                epochs=self.MAX_EPOCHS,
-                steps_per_epoch=1000,  # 这个值需要根据实际的每轮步数设置
-                pct_start=0.3,
-                anneal_strategy='cos'
+                mode='max',
+                factor=0.1,
+                patience=10,
+                min_lr=self.MIN_LEARNING_RATE
             )
         else:
-            return None
+            raise ValueError(f"不支持的学习率调度器: {self.LR_SCHEDULER}")
     
-    def load_training_state(self):
-        """加载训练状态"""
-        default_state = {
-            'current_epoch': 0,
-            'best_val_score': float('-inf'),
-            'total_epochs_run': 0,
-            'last_lr': self.LEARNING_RATE,
-            'training_time': 0,
-            'last_run_date': None,
-            'early_stop_counter': 0,
-            'best_epoch': 0,
-            'no_improvement_count': 0
+    def save_config(self, path: str) -> None:
+        """保存配置到文件"""
+        config_dict = {
+            key: value for key, value in self.__dict__.items()
+            if not key.startswith('_') and not callable(value)
         }
         
-        # 如果存在旧的状态文件，备份它
-        if self.STATE_FILE.exists():
-            backup_file = self.STATE_FILE.parent / f"training_state_backup_{int(time.time())}.json"
-            shutil.copy2(self.STATE_FILE, backup_file)
-            print(f"已备份旧的训练状态到: {backup_file}")
+        # 将Path对象转换为字符串
+        for key, value in config_dict.items():
+            if isinstance(value, Path):
+                config_dict[key] = str(value)
+            elif isinstance(value, torch.device):
+                config_dict[key] = str(value)
         
-        # 返回新的默认状态
-        return default_state
+        with open(path, 'w') as f:
+            json.dump(config_dict, f, indent=4)
     
-    def save_training_state(self, **kwargs):
-        """保存训练状态"""
-        state = self.training_state.copy()
-        state.update(kwargs)
-        state['last_run_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    def load_config(self, path: str) -> None:
+        """从文件加载配置"""
+        with open(path, 'r') as f:
+            config_dict = json.load(f)
         
-        with open(self.STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=4)
-        print(f"保存训练状态：当前第{state['current_epoch']}轮")
+        # 恢复Path对象和device
+        for key, value in config_dict.items():
+            if key.endswith('_DIR'):
+                config_dict[key] = Path(value)
+            elif key == 'DEVICE':
+                config_dict[key] = torch.device(value)
+        
+        self.__dict__.update(config_dict)
     
-    def should_stop_early(self, current_score):
-        """检查是否应该早停"""
-        if current_score > self.training_state['best_val_score']:
-            self.training_state['no_improvement_count'] = 0
-            self.training_state['best_val_score'] = current_score
-            self.training_state['best_epoch'] = self.training_state['current_epoch']
-            return False
-        
-        self.training_state['no_improvement_count'] += 1
-        if self.training_state['no_improvement_count'] >= self.EARLY_STOP_PATIENCE:
-            print(f"早停：{self.training_state['no_improvement_count']}轮未改善")
-            return True
-        
-        return False
+    def get_modulation_name(self, mod_type: int) -> str:
+        """获取调制类型名称"""
+        return self.MODULATION_DICT.get(mod_type, 'Unknown')
     
-    def get_classifier_paths(self, mod_name):
-        """获取特定调制类型的模型路径"""
-        mod_dir = self.CHECKPOINT_DIR / mod_name
-        return {
-            'state': mod_dir / "training_state.json",
-            'last': mod_dir / "last_checkpoint.pth",
-            'best': mod_dir / "best_checkpoint.pth"
-        }
+    def get_modulation_type(self, mod_name: str) -> int:
+        """获取调制类型编号"""
+        for mod_type, name in self.MODULATION_DICT.items():
+            if name == mod_name:
+                return mod_type
+        return -1
+    
+    def get_num_classes(self) -> int:
+        """获取类别数量"""
+        return len(self.MODULATION_DICT)
+    
+    def get_class_names(self) -> List[str]:
+        """获取所有类别名称"""
+        return list(self.MODULATION_DICT.values())
+    
+    def get_class_weights(self) -> torch.Tensor:
+        """获取类别权重"""
+        weights = torch.ones(self.get_num_classes())
+        return weights.to(self.DEVICE)
+    
+    def get_training_steps(self) -> int:
+        """获取总训练步数"""
+        steps_per_epoch = self.SAMPLES_PER_CLASS * len(self.MODULATION_DICT) // self.BATCH_SIZE
+        return steps_per_epoch * self.MAX_EPOCHS
+    
+    def get_modulation_params(self, mod_type: Union[int, str]) -> Dict[str, Any]:
+        """获取调制类型参数"""
+        if isinstance(mod_type, int):
+            mod_name = self.get_modulation_name(mod_type)
+        else:
+            mod_name = mod_type
+        return self.MODULATION_PARAMS.get(mod_name, {})

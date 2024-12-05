@@ -1,10 +1,14 @@
 import torch
 import torch.nn as nn
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from pathlib import Path
+import os
+import logging
+
 from project.config import Config
 
 class BaseModel(nn.Module):
-    def __init__(self, config=None):
+    def __init__(self, config: Optional[Config] = None) -> None:
         super().__init__()
         self.config = config if config is not None else Config()
     
@@ -31,7 +35,7 @@ class BaseModel(nn.Module):
         """将模型移动到指定设备"""
         self.to(self.config.DEVICE)
     
-    def _initialize_weights(self):
+    def _initialize_weights(self) -> None:
         """初始化模型权重"""
         for m in self.modules():
             if isinstance(m, nn.Conv1d):

@@ -3,359 +3,229 @@ import torch.nn as nn
 import torch.nn.functional as F
 import sys
 import os
+from pathlib import Path
+from typing import Optional, Dict, Callable
 
 # 添加项目根目录到Python路径
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
 from project.config import Config
+from project.model.modules import (
+    SEBlock,
+    DepthwiseSeparableConv1d,
+    MultiScaleModule,
+    AttentionPool1d
+)
 from project.model.base_model import BaseModel
 
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation块"""
-    def __init__(self, channel, reduction=16):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channel, channel // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        b, c, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1)
-        return x * y.expand_as(x)
-
-class DepthwiseSeparableConv1d(nn.Module):
-    """深度可分离卷积"""
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
-        super().__init__()
-        self.depthwise = nn.Conv1d(
-            in_channels, in_channels, kernel_size,
-            stride=stride, padding=padding, groups=in_channels
-        )
-        self.pointwise = nn.Conv1d(in_channels, out_channels, 1)
-
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        return x
-
 class ResidualBlock(nn.Module):
-    """残差块"""
-    def __init__(self, in_channels, out_channels, stride=1):
+    """增强版残差块"""
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
         super().__init__()
-        self.conv1 = DepthwiseSeparableConv1d(
-            in_channels, out_channels, kernel_size=3,
-            stride=stride, padding=1
+        # 第一个卷积分支
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(out_channels)
         )
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.conv2 = DepthwiseSeparableConv1d(
-            out_channels, out_channels, kernel_size=3,
-            padding=1
+        
+        # 第二个卷积���支（不同kernel size）
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=5, stride=stride, padding=2),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(out_channels, out_channels, kernel_size=5, padding=2),
+            nn.BatchNorm1d(out_channels)
         )
-        self.bn2 = nn.BatchNorm1d(out_channels)
+        
+        # SE注意力
         self.se = SEBlock(out_channels)
         
+        # shortcut连接
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
                 nn.BatchNorm1d(out_channels)
             )
+        
+        self.relu = nn.ReLU(inplace=True)
     
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 两个卷积分支
+        out1 = self.conv1(x)
+        out2 = self.conv2(x)
+        
+        # 融合两个分支
+        out = out1 + out2
+        
+        # 注意力机制
         out = self.se(out)
+        
+        # 残差连接
         out += self.shortcut(x)
-        out = F.relu(out)
+        out = self.relu(out)
+        
         return out
 
-class BinaryModulationClassifier(BaseModel):
-    """二分类调制分类器"""
-    def __init__(self, config):
+class MultiTaskSignalModel(BaseModel):
+    """多任务信号处理模型"""
+    def __init__(self, config: Optional[Config] = None) -> None:
         super().__init__(config)
         
-        # 特征提取层
-        self.features = nn.Sequential(
-            # 第一层卷积
-            nn.Conv1d(2, 64, kernel_size=3, padding=1),
+        # 特征提取主干网络
+        self.backbone = nn.Sequential(
+            # Stem
+            nn.Conv1d(2, 64, kernel_size=7, stride=2, padding=3),
             nn.BatchNorm1d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),
+            nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
             
-            # 第二层卷积
-            nn.Conv1d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),
+            # 残差层
+            self._make_layer(64, 128, 3, stride=1),     # 3个残差块
+            self._make_layer(128, 256, 4, stride=2),    # 4个残差块
+            self._make_layer(256, 512, 6, stride=2),    # 6个残差块
+            self._make_layer(512, 1024, 3, stride=2),   # 3个残差块
             
-            # 第三层卷积
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),
-            
-            # 第四层卷积
-            nn.Conv1d(256, 512, kernel_size=3, padding=1),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),
-            
-            # 全局平均池化
-            nn.AdaptiveAvgPool1d(1)
+            # 多尺度特征融合
+            MultiScaleModule(1024)
         )
         
-        # 分类头
-        self.classifier = nn.Sequential(
-            nn.Linear(512, self.config.FEATURE_DIM),
-            nn.ReLU(inplace=True),
-            nn.Dropout(self.config.DROPOUT_RATE),
-            nn.Linear(self.config.FEATURE_DIM, 1)
-        )
-        
-        # 初始化权重
-        self._initialize_weights()
-    
-    def forward(self, x):
-        # 特征提取
-        features = self.features(x)
-        features = features.squeeze(-1)
-        
-        # 分类预测
-        logits = self.classifier(features)
-        
-        return {
-            'logits': logits.squeeze(-1)
-        }
-
-class SymbolWidthRegressor(BaseModel):
-    """码元宽度回归模型"""
-    def __init__(self, config):
-        super().__init__(config)
-        
-        # 特征提取
-        self.features = nn.Sequential(
-            # 第一层卷积块
-            nn.Conv1d(2, 64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.MaxPool1d(2),
-            
-            # 第二层卷积块
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.MaxPool1d(2),
-            
-            # 第三层卷积块
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
+        # 调制分类分支
+        self.modulation_head = nn.Sequential(
+            AttentionPool1d(1024),
+            nn.Flatten(),
             nn.Dropout(0.2),
-            nn.MaxPool1d(2),
-            
-            # 第四层卷积块
-            nn.Conv1d(256, 512, kernel_size=3, padding=1),
+            nn.Linear(1024, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
-            nn.MaxPool1d(2),
-            
-            # 注意力层
-            SEBlock(512),
-            nn.AdaptiveAvgPool1d(1)
+            nn.Linear(512, len(self.config.MODULATION_DICT))
         )
         
-        # 回归器
-        self.regressor = nn.Sequential(
-            nn.Linear(512, config.FEATURE_DIM),
-            nn.BatchNorm1d(config.FEATURE_DIM),
+        # 码元宽度估计分支
+        self.symbol_width_head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(config.FEATURE_DIM, config.FEATURE_DIM // 2),
-            nn.BatchNorm1d(config.FEATURE_DIM // 2),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(config.FEATURE_DIM // 2, 1),
+            nn.Linear(256, 1),
             nn.Softplus()  # 确保输出为正数
         )
         
-        # 初始化权重
-        self._initialize_weights()
-    
-    def forward(self, x):
-        # 特征提取
-        x = self.features(x)
-        x = x.squeeze(-1)
-        
-        # 回归预测
-        pred = self.regressor(x)
-        
-        return {
-            'symbol_width': pred.squeeze()
-        }
-
-class ModulationClassifierEnsemble(BaseModel):
-    """调制分类器集成模型"""
-    def __init__(self, config=None):
-        super().__init__(config)
-        self.classifiers = nn.ModuleDict()
-        
-        # 为每种调制类型创建一个二分类器
-        for mod_type, mod_name in self.config.MODULATION_DICT.items():
-            classifier = BinaryModulationClassifier(self.config)
-            self.classifiers[mod_name] = classifier
-        
-        # 初始化温度参数（可训练）
-        if self.config.USE_TEMPERATURE_SCALING:
-            self.temperature = nn.Parameter(torch.ones(1) * self.config.TEMPERATURE)
-    
-    def forward(self, x):
-        # 收集每个分类器的预测结果
-        predictions = {}
-        confidences = {}
-        raw_outputs = {}
-        
-        for mod_name, classifier in self.classifiers.items():
-            # 获取每个分类器的预测
-            outputs = classifier(x)
-            logits = outputs['logits']
-            
-            # 应用温度缩放
-            if self.config.USE_TEMPERATURE_SCALING:
-                scaled_logits = logits / self.temperature
-                probs = torch.sigmoid(scaled_logits)
-            else:
-                probs = torch.sigmoid(logits)
-            
-            predictions[mod_name] = (probs > self.config.CONFIDENCE_THRESHOLD)
-            confidences[mod_name] = probs
-            raw_outputs[mod_name] = logits
-        
-        # 计算一致性得分
-        consistency_scores = {}
-        if self.config.USE_CONSISTENCY_SCORE:
-            for mod_name in self.config.MODULATION_DICT.values():
-                other_scores = []
-                for other_name, other_conf in confidences.items():
-                    if other_name != mod_name:
-                        agreement = 1 - torch.abs(confidences[mod_name] - (1 - other_conf)).mean()
-                        other_scores.append(agreement)
-                
-                if other_scores:
-                    consistency_scores[mod_name] = torch.stack(other_scores).mean()
-                else:
-                    consistency_scores[mod_name] = torch.tensor(0.0).to(x.device)
-        
-        # 计算最终得分
-        final_scores = {}
-        for mod_name in self.config.MODULATION_DICT.values():
-            base_confidence = confidences[mod_name].mean()
-            
-            if self.config.USE_CONSISTENCY_SCORE:
-                consistency = consistency_scores[mod_name]
-                # 结合置信度和一致性得分
-                final_scores[mod_name] = base_confidence * (0.7 + 0.3 * consistency)
-            else:
-                final_scores[mod_name] = base_confidence
-        
-        # 找到最高得分的预测
-        max_score = -float('inf')
-        predicted_mod = None
-        
-        for mod_name, score in final_scores.items():
-            if score > max_score:
-                max_score = score
-                predicted_mod = mod_name
-        
-        return {
-            'predictions': predictions,
-            'confidences': confidences,
-            'raw_outputs': raw_outputs,
-            'consistency_scores': consistency_scores if self.config.USE_CONSISTENCY_SCORE else None,
-            'final_scores': final_scores,
-            'predicted_mod': predicted_mod,
-            'max_confidence': max_score
-        }
-    
-    def train_single_classifier(self, mod_name, data, targets):
-        """训练单个分类器"""
-        classifier = self.classifiers[mod_name]
-        outputs = classifier(data)
-        
-        # 使用binary_cross_entropy_with_logits
-        loss = F.binary_cross_entropy_with_logits(
-            outputs['logits'],
-            targets['modulation_type']
+        # 码元序列解调分支
+        self.symbol_sequence_head = nn.Sequential(
+            nn.Conv1d(1024, 512, kernel_size=3, padding=1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(512, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(256, 1, kernel_size=1),  # 输出序列
+            nn.Tanh()  # 将输出限制在[-1,1]范围
         )
         
-        return loss
+        self._initialize_weights()
     
-    def calibrate_temperature(self, val_loader):
-        """使用验证集校准温度参数"""
-        if not self.config.USE_TEMPERATURE_SCALING:
-            return
+    def _make_layer(self, in_channels: int, out_channels: int, num_blocks: int, stride: int) -> nn.Sequential:
+        layers = []
+        layers.append(ResidualBlock(in_channels, out_channels, stride))
+        for _ in range(1, num_blocks):
+            layers.append(ResidualBlock(out_channels, out_channels))
+        return nn.Sequential(*layers)
+    
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # 提取特征
+        features = self.backbone(x)
         
-        self.eval()
-        nll_criterion = nn.CrossEntropyLoss()
+        # 调制分类
+        mod_logits = self.modulation_head(features)
         
-        logits_list = []
-        labels_list = []
+        # 码元宽度估计
+        symbol_width = self.symbol_width_head(features)
         
+        # 码元序列解调
+        symbol_sequence = self.symbol_sequence_head(features)
+        
+        return {
+            'modulation_type': mod_logits,
+            'symbol_width': symbol_width,
+            'symbol_sequence': symbol_sequence,
+            'features': features
+        }
+    
+    def get_loss_function(self) -> Callable[[Dict[str, torch.Tensor], Dict[str, torch.Tensor]], torch.Tensor]:
+        """获取多任务损失函数"""
+        def criterion(outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+            # 调制分类损失 (交叉熵 + 标签平滑)
+            mod_targets = self._apply_label_smoothing(
+                targets['modulation_type'],
+                len(self.config.MODULATION_DICT),
+                self.config.LABEL_SMOOTHING
+            )
+            mod_loss = -(mod_targets * 
+                        F.log_softmax(outputs['modulation_type'], dim=1)).sum(dim=1).mean()
+            
+            # 码元宽度估计损失 (相对误差)
+            width_loss = torch.abs(outputs['symbol_width'] - targets['symbol_width']) / targets['symbol_width']
+            width_loss = width_loss.mean()
+            
+            # 码元序列解调损失 (余弦相似度)
+            seq_loss = 1 - F.cosine_similarity(
+                outputs['symbol_sequence'].squeeze(1),
+                targets['symbol_sequence'],
+                dim=1
+            ).mean()
+            
+            # 特征正则化损失
+            l2_loss = torch.norm(outputs['features'], p=2, dim=1).mean()
+            
+            # 总损失 (根据评分权重)
+            total_loss = (
+                0.2 * mod_loss +      # 调制分类 20%
+                0.3 * width_loss +    # 码元宽度 30%
+                0.5 * seq_loss +      # 码元序列 50%
+                0.001 * l2_loss       # 正则化
+            )
+            
+            return total_loss
+        
+        return criterion
+    
+    def _apply_label_smoothing(self, targets: torch.Tensor, num_classes: int, smoothing: float = 0.1) -> torch.Tensor:
+        """标签平滑"""
         with torch.no_grad():
-            for batch in val_loader:
-                data = batch['data'].to(self.config.DEVICE)
-                labels = batch['modulation_type'].to(self.config.DEVICE)
-                
-                outputs = self(data)
-                # 收集所有分类器的logits
-                for mod_name, logits in outputs['raw_outputs'].items():
-                    logits_list.append(logits)
-                    labels_list.append((labels == self.config.MODULATION_DICT.index(mod_name)).float())
-        
-        logits = torch.cat(logits_list)
-        labels = torch.cat(labels_list)
-        
-        # 优化温度参数
-        optimizer = torch.optim.LBFGS([self.temperature], lr=0.01, max_iter=50)
-        
-        def eval():
-            optimizer.zero_grad()
-            loss = nll_criterion(logits / self.temperature, labels)
-            loss.backward()
-            return loss
-        
-        optimizer.step(eval)
-        
-        print(f"校准后的温度参数: {self.temperature.item():.3f}")
+            targets = targets.reshape(-1)
+            targets_one_hot = torch.zeros(
+                (targets.size(0), num_classes), 
+                dtype=torch.float32,
+                device=targets.device
+            )
+            targets_one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
+            targets_smooth = (1.0 - smoothing) * targets_one_hot + \
+                           smoothing / num_classes
+        return targets_smooth
     
-    def save_classifiers(self, path):
-        """保存所有分类器"""
-        for mod_name, classifier in self.classifiers.items():
-            save_path = path / f"{mod_name}_classifier.pth"
-            classifier.save_model(str(save_path))
-        
-        # 保存温度参数
-        if self.config.USE_TEMPERATURE_SCALING:
-            temp_path = path / "temperature.pth"
-            torch.save({'temperature': self.temperature}, str(temp_path))
-    
-    def load_classifiers(self, path):
-        """加载所有分类器"""
-        for mod_name, classifier in self.classifiers.items():
-            load_path = path / f"{mod_name}_classifier.pth"
-            if load_path.exists():
-                classifier.load_model(str(load_path))
-        
-        # 加载温度参数
-        if self.config.USE_TEMPERATURE_SCALING:
-            temp_path = path / "temperature.pth"
-            if temp_path.exists():
-                temp_state = torch.load(str(temp_path))
-                self.temperature.data = temp_state['temperature']
+    def _initialize_weights(self):
+        """初始化权重"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
