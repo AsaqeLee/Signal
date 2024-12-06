@@ -22,22 +22,22 @@ class Config:
     MAX_SYMBOL_WIDTH: float = 1e-4  # 最大码元宽度(100us)
     
     # 模型参数
-    BACKBONE_CHANNELS: List[int] = [64, 128, 256, 512, 1024]  # 主干网络通道数
+    BACKBONE_CHANNELS: List[int] = [64, 128, 256, 512]  # 主干网络通道数
     FEATURE_DIM: int = 1024
-    DROPOUT_RATE: float = 0.2
+    DROPOUT_RATE: float = 0.3
     USE_TEMPERATURE_SCALING: bool = True
     TEMPERATURE: float = 1.0
     CONFIDENCE_THRESHOLD: float = 0.5
     
     # 训练参数
-    BATCH_SIZE: int = 128
+    BATCH_SIZE: int = 256
     GRADIENT_ACCUMULATION_STEPS: int = 2
     MAX_EPOCHS: int = 300
     
     # 任务权重
-    MT_WEIGHT: float = 0.5
-    SW_WEIGHT: float = 0.3
-    CQ_WEIGHT: float = 0.2
+    MT_WEIGHT: float = 0.4
+    SW_WEIGHT: float = 0.6
+    CQ_WEIGHT: float = 0.0
     
     # 评分阈值
     SW_THRESHOLDS: Dict[str, float] = {
@@ -45,14 +45,11 @@ class Config:
         'acceptable': 0.2  # 0.05 < ERk <= 0.2 按比例得分
     }
     
-    CQ_THRESHOLDS: Dict[str, float] = {
-        'perfect': 0.95,  # CSi >= 0.95 得满分
-        'acceptable': 0.7  # 0.7 <= CSi < 0.95 按比例得分
-    }
+    CQ_THRESHOLDS: Dict[str, float] = {}
     
     # 优化器参数
     OPTIMIZER: str = 'adamw'
-    LEARNING_RATE: float = 5e-4
+    LEARNING_RATE: float = 1e-3
     MIN_LEARNING_RATE: float = 1e-6
     WEIGHT_DECAY: float = 0.01
     MOMENTUM = 0.9
@@ -68,19 +65,19 @@ class Config:
     
     # 正则化参数
     LABEL_SMOOTHING: float = 0.1
-    GRADIENT_CLIP_VAL: float = 0.5
-    L2_REG_WEIGHT: float = 0.005
+    GRADIENT_CLIP_VAL: float = 1.0
+    L2_REG_WEIGHT: float = 0.01
     
     # 数据增强参数
     USE_MIXUP = True
     MIXUP_ALPHA = 0.2
-    USE_CUTMIX = False
+    USE_CUTMIX = True
     CUTMIX_ALPHA = 1.0
     USE_SPECAUGMENT = True
-    USE_RANDOM_ERASING = False
+    USE_RANDOM_ERASING = True
     
     # 早停参数
-    EARLY_STOPPING_PATIENCE: int = 30
+    EARLY_STOPPING_PATIENCE: int = 20
     EARLY_STOPPING_MIN_DELTA: float = 1e-4
     EARLY_STOPPING_METRIC: str = 'mt_score'
     
