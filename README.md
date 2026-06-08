@@ -1,86 +1,103 @@
-# 调制分类项目
+<div align="center">
 
-这是一个使用深度学习进行信号调制分类的项目。
+# Signal Intelligence
 
-## 项目结构
+**Deep Learning for Signal Modulation Classification and DSP**
 
+[![Model: CNN--Attention](https://img.shields.io/badge/model-cnn--attention-000000.svg?style=flat-square)](https://github.com/AsaqeLee/Signal)
+[![Framework: PyTorch](https://img.shields.io/badge/framework-pytorch-000000.svg?style=flat-square)](https://github.com/AsaqeLee/Signal)
+[![Status: High--Integrity](https://img.shields.io/badge/status-high--integrity-000000.svg?style=flat-square)](https://github.com/AsaqeLee/Signal)
+
+English | [简体中文](./README_ZH.md)
+
+</div>
+
+---
+
+## Introduction
+
+**Signal Intelligence** is an advanced framework for automatic modulation classification (AMC) utilizing deep learning. It integrates multi-scale feature fusion and attention mechanisms to identify signal types across challenging channel conditions, including multi-path fading and frequency offsets.
+
+>[!IMPORTANT]
+>This project utilizes Squeeze-and-Excitation (SE) blocks and depthwise separable convolutions to maintain high accuracy with minimal computational overhead.
+
+---
+
+## Architecture Flow
+
+The pipeline handles raw signal ingestion through inference.
+
+```mermaid
+graph LR
+    Input[Raw I/Q Signal] --> Aug[Augmentation Layer]
+    Aug --> CNN[Multi-Scale CNN]
+    CNN --> Attn[Attention Mechanism]
+    Attn --> Classify[Modulation Classifier]
+    Classify --> Output[Probability Distribution]
+    
+    style CNN fill:none,stroke:#000,stroke-width:2px
+    style Attn fill:none,stroke:#000,stroke-width:2px
 ```
+
+---
+
+## Technical Specifications
+
+<details>
+<summary><b>Model Internal Structure</b></summary>
+
+```text
 project/
-├── config.py          # 配置文件
-├── train.py          # 训练脚本
-├── data/             # 数据处理相关
-│   ├── dataset.py    # 数据集类
-│   └── augmentations.py  # 数据增强
-├── model/            # 模型相关
-│   ├── base_model.py     # 基础模型类
-│   ├── modules.py        # 模型组件
-│   └── modulation_classifier.py  # 调制分类器
-└── utils/            # 工具函数
-    ├── metrics.py        # 评估指标
-    └── early_stopping.py # 早停机制
+├── model/
+│   ├── modulation_classifier.py  # Core Orchestrator
+│   ├── modules.py                # SE Blocks & Depthwise Conv
+│   └── base_model.py             # Feature Extraction Backbone
+├── data/
+│   ├── dataset.py                # High-efficiency Loader
+│   └── augmentations.py          # Phase & Frequency Jitter
+└── utils/                        # Metrics & Early Stopping
 ```
+</details>
 
-## 安装依赖
+<details>
+<summary><b>Hardened Training Strategy</b></summary>
 
+The system employs several advanced techniques to ensure convergence and generalization:
+- **Optimizer:** AdamW with weight decay.
+- **Scheduler:** Cosine Annealing with Restarts.
+- **Regularization:** Label Smoothing and Feature Normalization.
+- **Mixed Precision:** FP16 training for accelerated iteration.
+</details>
+
+<details>
+<summary><b>Installation & Training</b></summary>
+
+### Prerequisites
+- Python 3.9+
+- CUDA-compatible GPU (recommended)
+
+### Execution
 ```bash
+# Install dependencies
 pip install -r requirements.txt
-```
 
-## 数据准备
-
-将数据放在`train_data_true`目录下，按照调制类型分类:
-
-```
-train_data_true/
-├── BPSK/
-├── QPSK/
-├── 8PSK/
-└── ...
-```
-
-## 训练模型
-
-```bash
+# Start distributed training
 python -m project.train
 ```
+</details>
 
-## 主要特性
+---
 
-- 改进的模型架构
-  - Squeeze-and-Excitation模块
-  - 深度可分离卷积
-  - 多尺度特征融合
-  - 注意力机制
+## Strategic Capabilities
 
-- 增强的训练策略
-  - AdamW优化器
-  - 余弦退火学习率
-  - 梯度累积
-  - 混合精度训练
+- **Resilient DSP:** Robust against multi-path effects and frequency drift.
+- **Feature Fusion:** Combines global and local features for superior classification.
+- **Adaptive Augmentation:** Dynamic signal noise injection during training.
 
-- 丰富的数据增强
-  - 信号噪声
-  - 频率偏移
-  - 相位噪声
-  - 多径效应
-  - 频谱增强
-  - 随机擦除
+---
 
-## 配置说明
+<div align="center">
 
-主要配置参数在`config.py`中:
+&copy; 2026 AsaqeLee. Built for advanced signal processing research.
 
-- `BATCH_SIZE`: 批次大小
-- `LEARNING_RATE`: 学习率
-- `MAX_EPOCHS`: 最大训练轮数
-- `FEATURE_DIM`: 特征维度
-- `DROPOUT_RATE`: Dropout比率
-- 等等
-
-## 模型说明
-
-- 使用改进的卷积神经网络进行特征提取
-- 多尺度特征融合提高特征表达能力
-- 注意力机制关注重要特征
-- 辅助分类器帮助训练
-- 标签平滑和特征正则化防止过拟合
+</div>
