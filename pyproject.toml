@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signal-modulation-classification"
+version = "0.1.0"
+description = "Deep-learning workflows for modulation classification from raw communication signals."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Asaqe Lee"}
+]
+dependencies = [
+    "torch>=1.9.0",
+    "numpy>=1.19.2",
+    "tqdm>=4.50.0",
+    "wandb>=0.12.0",
+    "scikit-learn>=0.24.0",
+    "scipy>=1.6.0",
+    "pandas>=1.2.0",
+    "matplotlib>=3.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.1.0",
+    "pytest>=7.0.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+select = ["E", "F", "I", "N", "W"]
+ignore = []
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]
