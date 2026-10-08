@@ -57,4 +57,6 @@ See `project/run.py`, `Signal_LAB.md`, and training scripts for dataset paths an
 
 Research code. Avoid “production-grade” claims unless your own deployment checklist is complete. Model checkpoints and datasets are not assumed to be redistributed with every clone; configure paths locally.
 
-No root LICENSE file is present at the time of this rewrite.
+## License
+
+MIT. See [LICENSE](LICENSE).
