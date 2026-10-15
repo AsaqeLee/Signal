@@ -1,4 +1,4 @@
-torch>=1.9.0
+torch>=2.14.1
 numpy>=1.19.2
 tqdm>=4.50.0
 wandb>=0.12.0
