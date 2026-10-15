@@ -101,3 +101,20 @@ python -m project.train
 &copy; 2026 AsaqeLee. 为先进信号处理研究而设计。
 
 </div>
+## 复现步骤
+
+```bash
+pip install -r project/requirements.txt pytest
+pytest tests/                 # 无需数据集
+python -m project.inference   # 随机 I/Q 输入的推理示例（未训练权重）
+# 训练：数据集未包含。按 ./train_data_true/<调制类型>/data_<N>.csv（两列 I、Q）放置，每类至少 16200 个文件
+python -m project.train
+```
+
+- 输出目录为 `./output/`；默认启用 wandb，可在 `project/config.py` 中将 `USE_WANDB` 设为 `False`。
+- `project/run.py` 为比赛提交模板，预测部分仍为占位值。
+
+## 结果
+
+仓库中没有评估图表。唯一的记录是 `output/checkpoints/training_state.json`（2024-11-30）：训练 15 个 epoch，约 35 分钟，最佳验证得分 0.331，属于早期未完成的训练，不作为基准。
+
